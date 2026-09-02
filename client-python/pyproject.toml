@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "graduation-client"
+version = "0.1.0"
+description = "Python client skeleton for the graduation project"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "PySide6==6.11.2",
+    "live2d-py==0.7.0.4",
+    "PyOpenGL>=3.1",
+    "Pillow>=10.0",
+    "numpy>=1.24",
+    "opencv-contrib-python>=5.0",
+    "mediapipe>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.setuptools.package-data]
+app = [
+    "resources/backgrounds/*",
+    "resources/images/*.png",
+    "resources/images/*.ico",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
+pythonVersion = "3.13"

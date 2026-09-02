@@ -1,0 +1,70 @@
+# 素材和资源文件
+材料/
+client-python/models/
+client-python/docs/
+client-python/app/resources/
+tools/
+*.ico
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.docx
+*.pdf
+
+# Live2D 模型文件
+*.moc3
+*.model3.json
+*.physics3.json
+*.cdi3.json
+*.vtube.json
+*.exp3.json
+*.motion3.json
+*.cmo3
+*.can3
+
+# 语音模型文件
+*.pth
+*.pth.qkdownloading
+
+# VRM 模型文件
+*.vrm
+
+# Python 虚拟环境
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Python 依赖
+*.egg-info/
+dist/
+build/
+
+# IDE 配置
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 操作系统文件
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Java 编译文件
+*.class
+target/
+*.jar
+
+# 日志文件
+*.log
+logs/
+
+# 环境变量文件
+.env
+.env.local

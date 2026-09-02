@@ -1,0 +1,6 @@
+{
+  "venvPath": "client-python",
+  "venv": ".venv",
+  "pythonVersion": "3.13",
+  "include": ["client-python"]
+}
