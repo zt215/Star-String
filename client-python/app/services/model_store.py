@@ -14,6 +14,11 @@ from pathlib import Path
 STAR_STRING_DIR = Path.home() / ".star_string"
 ACCOUNTS_DATA_DIR = STAR_STRING_DIR / "accounts_data"
 
+# Separate local profile used by offline login. It must never read account data.
+LOCAL_PROFILE = "__local__"
+LOCAL_PROFILE_DISPLAY = "本地用户"
+LOCAL_PROFILE_DIR = STAR_STRING_DIR / "local_profile"
+
 # Legacy global model storage (used before per-account isolation).
 LEGACY_MODELS_DIR = STAR_STRING_DIR / "models"
 LEGACY_REGISTRY_FILE = STAR_STRING_DIR / "models.json"
@@ -53,13 +58,20 @@ class ModelEntry:
 
 
 class ModelStore:
-    """Per-account model store; each account owns its own models.json and models/ dir."""
+    """Per-account model store; each account owns its own models.json and models/ dir.
+
+    If ``account`` is :data:`LOCAL_PROFILE`, the store is the separate offline/local
+    profile and never touches any account data.
+    """
 
     def __init__(self, account: str | None = None, registry_file: Path | None = None) -> None:
         self.account = account or "default"
         if registry_file is not None:
             self.registry_file = Path(registry_file)
             self.models_dir = self.registry_file.parent / "models"
+        elif self.account == LOCAL_PROFILE:
+            self.registry_file = LOCAL_PROFILE_DIR / "models.json"
+            self.models_dir = LOCAL_PROFILE_DIR / "models"
         else:
             base = ACCOUNTS_DATA_DIR / _safe_account_name(self.account)
             self.registry_file = base / "models.json"
@@ -156,6 +168,31 @@ class ModelStore:
         self.save(entries)
         return entry
 
+    def import_vrm(self, source: Path) -> ModelEntry:
+        """导入 VRM 模型"""
+        source = source.resolve()
+        target_dir = self.models_dir / "vrm" / uuid.uuid4().hex[:8]
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        # 复制 VRM 文件到目标目录
+        if source.is_file():
+            shutil.copy2(source, target_dir / source.name)
+        else:
+            raise ValueError("VRM 模型必须是文件")
+
+        name = self._normalize_name(source.stem)
+        entry = ModelEntry(
+            kind="vrm",
+            name=name,
+            path=str(target_dir / source.name),
+            active=False,
+            created_at=datetime.now().isoformat(timespec="seconds"),
+        )
+        entries = self.load()
+        entries.append(entry)
+        self.save(entries)
+        return entry
+
     # ---- selection / removal ----
 
     def set_active(self, kind: str, name: str) -> list[ModelEntry]:
@@ -163,6 +200,14 @@ class ModelStore:
         for entry in entries:
             if entry.kind == kind:
                 entry.active = entry.name == name
+        self.save(entries)
+        return entries
+
+    def rename(self, kind: str, old_name: str, new_name: str) -> list[ModelEntry]:
+        entries = self.load()
+        for entry in entries:
+            if entry.kind == kind and entry.name == old_name:
+                entry.name = new_name
         self.save(entries)
         return entries
 

@@ -14,6 +14,7 @@ class Account:
     password: str = ""
     remember_password: bool = False
     auto_login: bool = False
+    offline: bool = False
 
 
 class AccountStore:
@@ -39,6 +40,7 @@ class AccountStore:
                         password=str(item.get("password", "")),
                         remember_password=bool(item.get("remember_password", False)),
                         auto_login=bool(item.get("auto_login", False)),
+                        offline=bool(item.get("offline", False)),
                     )
                 )
         return result

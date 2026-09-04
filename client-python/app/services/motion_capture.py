@@ -68,6 +68,7 @@ class MotionCapture(QObject):
         super().__init__(parent)
         self._camera_index = 0
         self._mirror = False
+        self._lr_mirror = False
         self._sensitivity = 1.0
         self._drive_enabled = True
         self._running = False
@@ -105,6 +106,10 @@ class MotionCapture(QObject):
 
     def set_mirror(self, enabled: bool) -> None:
         self._mirror = bool(enabled)
+
+    def set_lr_mirror(self, enabled: bool) -> None:
+        """Mirror left/right: swap side signals and flip lateral directions."""
+        self._lr_mirror = bool(enabled)
 
     def set_sensitivity(self, value: float) -> None:
         self._sensitivity = max(0.1, min(3.0, float(value)))
@@ -302,7 +307,12 @@ class MotionCapture(QObject):
                 self._last_body_y = body_y
             drive["body_angle_x"] = self._last_body_x
             drive["body_angle_y"] = self._last_body_y
-            self._apply_arms(drive)
+            # Hand tracking is more reliable for arm poses than body keypoints, so
+            # only fall back to body-derived arms when no hand is detected.
+            if not self._hand_detected:
+                self._apply_arms(drive)
+            # full-body: legs (+ arms as fallback) from the pose keypoints
+            self._apply_body(drive)
         drive = self._apply_drive_params(drive)
 
         return drive
@@ -317,8 +327,51 @@ class MotionCapture(QObject):
         drive["arm_l"] = (pts[5][1] - pts[9][1]) / width
         drive["arm_r"] = (pts[6][1] - pts[10][1]) / width
 
+    def _apply_body(self, drive: dict) -> None:
+        """Map YOLO pose keypoints to full-body joint angles (degrees).
+
+        Only drives motions that are actually visible/reliable in a 2D frontal
+        pose (thigh side-swing, knee bend).  Forward hip-flexion can't be
+        recovered from a single camera, so it stays at 0.  Every limb is
+        confidence-gated: if its keypoints are missing or low-confidence the
+        drive is zeroed so the avatar holds still instead of flailing.
+        """
+        if not self._body_points or not self._body_detected:
+            return
+        pts = self._body_points
+
+        def P(i: int) -> np.ndarray:
+            return np.array([pts[i][0], pts[i][1]], dtype=np.float32)
+
+        def conf(i: int) -> float:
+            return float(pts[i][2])
+
+        lsh, rsh = P(5), P(6)
+        lhip, rhip = P(11), P(12)
+        torso = float(np.linalg.norm((lsh + rsh) / 2.0 - (lhip + rhip) / 2.0)) + 1e-6
+
+        def angle3(a, b, c) -> float:
+            v1 = a - b
+            v2 = c - b
+            cos = float(np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-6))
+            return math.degrees(math.acos(max(-1.0, min(1.0, cos))))
+
+        for side, (hip_i, knee_i, ankle_i) in (("l", (11, 13, 15)), ("r", (12, 14, 16))):
+            drive[f"thigh_{side}"] = 0.0
+            drive[f"knee_{side}"] = 0.0
+            if min(conf(hip_i), conf(knee_i), conf(ankle_i)) < 0.3:
+                continue  # limb not confidently detected -> hold still
+            hip, knee, ankle = P(hip_i), P(knee_i), P(ankle_i)
+            dk = knee - hip
+            side_deg = math.degrees(math.atan2(dk[0], max(abs(dk[1]), 1e-3)))
+            knee_deg = max(0.0, 180.0 - angle3(hip, knee, ankle))
+            drive[f"thigh_{side}"] = -side_deg * 0.6
+            drive[f"knee_{side}"] = knee_deg
+
     def _apply_drive_params(self, drive: dict) -> dict:
-        for key in ("angle_x", "angle_y", "angle_z", "body_angle_x", "body_angle_y", "arm_l", "arm_r", "eye_x", "eye_y"):
+        for key in ("angle_x", "angle_y", "angle_z", "body_angle_x", "body_angle_y",
+                    "arm_l", "arm_r", "arm_l_x", "arm_r_x", "eye_x", "eye_y",
+                    "thigh_l", "thigh_r", "thigh_lift_l", "thigh_lift_r", "knee_l", "knee_r"):
             cfg = self._params.get(key, {})
             mult = float(cfg.get("mult", 1.0))
             value = drive.get(key, 0.0) * mult
@@ -329,7 +382,24 @@ class MotionCapture(QObject):
             cfg = self._params.get("eye", {})
             mult = float(cfg.get("mult", 1.0))
             drive[key] = _clamp(drive.get(key, 0.0) * mult, 0.0, 1.0)
+        if self._lr_mirror:
+            self._swap_lr(drive)
         return drive
+
+    def _swap_lr(self, drive: dict) -> None:
+        """Mirror left/right: swap side keys and flip lateral directions."""
+        for a, b in (("arm_l", "arm_r"), ("arm_l_x", "arm_r_x"),
+                     ("thigh_l", "thigh_r"), ("thigh_lift_l", "thigh_lift_r"),
+                     ("knee_l", "knee_r")):
+            va, vb = drive.get(a, 0.0), drive.get(b, 0.0)
+            drive[a], drive[b] = vb, va
+        for i in range(5):
+            kl, kr = f"finger_l_{i}", f"finger_r_{i}"
+            vl, vr = drive.get(kl, 0.0), drive.get(kr, 0.0)
+            drive[kl], drive[kr] = vr, vl
+        # lateral direction flips (side swing / hand horizontal)
+        for key in ("arm_l_x", "arm_r_x", "thigh_l", "thigh_r"):
+            drive[key] = -drive.get(key, 0.0)
 
     def _apply_face(self, frame: np.ndarray, drive: dict) -> None:
         landmarker = self._face_landmarker
@@ -352,9 +422,14 @@ class MotionCapture(QObject):
             for lm in result.face_landmarks[0]
         ]
         self._face_detected = True
+        landmarks = result.face_landmarks[0]
         self._apply_head_pose(result, drive)
 
-        landmarks = result.face_landmarks[0]
+        # Iris landmarks (468/473) let us drive the model's eyeballs from the
+        # actual gaze direction. If the underlying model only returns the base
+        # face mesh, this is a no-op and head pose remains the fallback.
+        self._apply_eye_gaze(landmarks, drive)
+
         ear_l = self._ear_from(landmarks, 159, 145, 133, 33)
         ear_r = self._ear_from(landmarks, 386, 374, 362, 263)
         blink_l = blink_r = 0.0
@@ -385,6 +460,52 @@ class MotionCapture(QObject):
     def _map_ear(ear: float) -> float:
         return _clamp((ear - 0.16) / (0.28 - 0.16), 0.0, 1.0)
 
+    @staticmethod
+    def _apply_eye_gaze(landmarks, drive: dict) -> bool:
+        """Use MediaPipe iris landmarks to move the model eyeballs.
+
+        MediaPipe FaceLandmarker usually returns 478 landmarks; indices 468 and
+        473 are the left/right iris centers.  The returned bool tells the caller
+        whether gaze really was available (otherwise keep head-pose fallback).
+        """
+        if len(landmarks) < 474:
+            return False
+        try:
+            def point(index: int) -> np.ndarray:
+                lm = landmarks[index]
+                return np.array([lm.x, lm.y], dtype=np.float32)
+
+            left_iris = point(468)
+            right_iris = point(473)
+
+            # Eye centers are the average of the two corners and upper/lower lids.
+            left_center = (point(33) + point(133) + point(159) + point(145)) / 4.0
+            right_center = (point(362) + point(263) + point(386) + point(374)) / 4.0
+
+            left_width = float(np.linalg.norm(point(33) - point(133)))
+            left_height = float(np.linalg.norm(point(159) - point(145)))
+            right_width = float(np.linalg.norm(point(362) - point(263)))
+            right_height = float(np.linalg.norm(point(386) - point(374)))
+            if min(left_width, right_width, left_height, right_height) < 1e-6:
+                return False
+
+            # Normalise iris offset by eye size, then scale to the Live2D eyeball
+            # parameter range.  The y axis is flipped because image y grows downward.
+            gaze_x = (
+                (left_iris[0] - left_center[0]) / left_width
+                + (right_iris[0] - right_center[0]) / right_width
+            ) * 0.5
+            gaze_y = (
+                (left_iris[1] - left_center[1]) / left_height
+                + (right_iris[1] - right_center[1]) / right_height
+            ) * 0.5
+
+            drive["eye_x"] = _clamp(gaze_x / 0.20, -1.0, 1.0) * 18.0
+            drive["eye_y"] = _clamp(-gaze_y / 0.25, -1.0, 1.0) * 18.0
+            return True
+        except Exception:
+            return False
+
     def _apply_hands(self, frame: np.ndarray, drive: dict) -> None:
         self._hand_points = []
         self._hand_detected = False
@@ -401,18 +522,42 @@ class MotionCapture(QObject):
             return
         height, width = frame.shape[:2]
         center_y = height / 2.0
+        center_x = width / 2.0
         for index, hand in enumerate(result.hand_landmarks):
             points = [(float(lm.x) * width, float(lm.y) * height) for lm in hand]
             self._hand_points.append(points)
             label = "Right"
             if result.handedness and index < len(result.handedness) and result.handedness[index]:
                 label = result.handedness[index][0].category_name
-            raise_ = (center_y - points[0][1]) / max(height, 1e-6)
-            if label == "Left":
-                drive["arm_l"] = raise_ * 2.0
-            else:
-                drive["arm_r"] = raise_ * 2.0
+            # wrist position (two DOF) and finger curls
+            wx, wy = points[0]
+            nx = (wx - center_x) / max(width / 2.0, 1e-6)          # left/right, -1..1
+            ny = (center_y - wy) / max(height / 2.0, 1e-6)         # up/down, +up
+            is_left = label == "Left"
+            base = "arm_l" if is_left else "arm_r"
+            drive[base] = _clamp(ny, -1.0, 1.0)
+            drive[base + "_x"] = _clamp(nx, -1.0, 1.0)
+            # per-finger curl (0..1) from the PIP-joint angle
+            fingers = [self._finger_curl(points, a, b, c) for (a, b, c) in
+                       [(5, 6, 7), (9, 10, 11), (13, 14, 15), (17, 18, 19), (2, 3, 4)]]
+            key = "finger_l" if is_left else "finger_r"
+            for fi, curl in enumerate(fingers):
+                drive[f"{key}_{fi}"] = curl
         self._hand_detected = True
+
+    @staticmethod
+    def _finger_curl(points, a: int, b: int, c: int) -> float:
+        """Curl (0=straight .. 1=bent) from the joint angle at point ``b``."""
+        v1 = np.array([points[a][0] - points[b][0], points[a][1] - points[b][1]], dtype=np.float32)
+        v2 = np.array([points[c][0] - points[b][0], points[c][1] - points[b][1]], dtype=np.float32)
+        n1 = float(np.linalg.norm(v1))
+        n2 = float(np.linalg.norm(v2))
+        if n1 < 1e-6 or n2 < 1e-6:
+            return 0.0
+        cosang = float(np.dot(v1, v2) / (n1 * n2))
+        cosang = max(-1.0, min(1.0, cosang))
+        ang = math.degrees(math.acos(cosang))
+        return max(0.0, min(1.0, (180.0 - ang) / 180.0))
 
     def _apply_head_pose(self, result, drive: dict) -> None:
         matrixes = getattr(result, "facial_transformation_matrixes", None)
@@ -518,11 +663,14 @@ class MotionCapture(QObject):
             right_hip = kp[12 * 3 : 12 * 3 + 2]
             shoulder_mid = (left_shoulder + right_shoulder) / 2.0
             hip_mid = (left_hip + right_hip) / 2.0
-            dx = float(shoulder_mid[0] - hip_mid[0])
-            dy = float(shoulder_mid[1] - hip_mid[1])
-            return self._smooth_value("bx", dx * 40.0 * self._sensitivity), self._smooth_value(
-                "by", dy * 30.0 * self._sensitivity
-            )
+            # Normalise by torso length so a standing person gives ~0 lean and a
+            # genuine side-lean gives a bounded value. Forward/back (depth) lean
+            # cannot be recovered from a 2D pose, so body_angle_y stays 0.
+            torso = float(abs(float(hip_mid[1]) - float(shoulder_mid[1])))
+            if torso < 1e-3:
+                return 0.0, 0.0
+            side = float(float(shoulder_mid[0]) - float(hip_mid[0])) / torso
+            return self._smooth_value("bx", side * 45.0 * self._sensitivity), 0.0
         except Exception:
             return 0.0, 0.0
 

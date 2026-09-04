@@ -9,7 +9,6 @@
 
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -36,30 +35,25 @@ class ModelParam:
     default_value: float
 
 
-class ModelViewInterface(ABC):
+class ModelViewInterface:
     """模型视图的统一接口"""
 
-    @abstractmethod
     def model_type(self) -> ModelType:
         """返回模型类型"""
-        pass
+        raise NotImplementedError
 
-    @abstractmethod
     def load_model(self, path: str | Path) -> None:
         """加载模型"""
-        pass
+        raise NotImplementedError
 
-    @abstractmethod
     def clear_model(self) -> None:
         """清除模型"""
-        pass
+        raise NotImplementedError
 
-    @abstractmethod
     def get_supported_params(self) -> list[ModelParam]:
         """获取模型支持的参数列表"""
-        pass
+        raise NotImplementedError
 
-    @abstractmethod
     def set_drive_params(
         self,
         angle_x: float = 0.0,
@@ -77,12 +71,11 @@ class ModelViewInterface(ABC):
         **kwargs: Any,
     ) -> None:
         """设置动捕驱动参数"""
-        pass
+        raise NotImplementedError
 
-    @abstractmethod
     def play_motion(self, group: str = "Tap") -> None:
         """播放动作"""
-        pass
+        raise NotImplementedError
 
 
 class ModelViewSignals(QObject):

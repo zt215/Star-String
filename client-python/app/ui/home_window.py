@@ -15,10 +15,12 @@ from PySide6.QtWidgets import (
     QFrame,
     QGridLayout,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
     QMainWindow,
+    QMessageBox,
     QPushButton,
     QScrollArea,
     QSpinBox,
@@ -27,23 +29,39 @@ from PySide6.QtWidgets import (
     QStyle,
     QStyleOptionComboBox,
     QStyleOptionSpinBox,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
 from app.services.auth_service import LoginError, get_profile, update_profile
-from app.services.model_store import ModelStore
+from app.services.cloud_service import (
+    CloudApiError,
+    delete_cloud_model,
+    delete_cloud_preset,
+    download_cloud_model,
+    list_cloud_models,
+    list_cloud_presets,
+    upload_cloud_model,
+    upload_cloud_preset,
+)
+from app.services.model_store import (
+    LOCAL_PROFILE,
+    LOCAL_PROFILE_DISPLAY,
+    ModelStore,
+)
 from app.services.motion_capture import MotionCapture
 from app.services.settings_store import SettingsStore
 from app.ui.dialogs import show_info, show_warning
 from app.ui.live2d_view import Live2DView
+from app.ui.vrm_view import VRMView
 
 
 RESOURCES_DIR = Path(__file__).resolve().parent.parent / "resources"
 LOGO_PATH = RESOURCES_DIR / "images" / "star_logo.png"
 ICON_PATH = RESOURCES_DIR / "images" / "star_logo.ico"
 
-NAV_ITEMS = ["首页", "视频动捕", "音频变声", "虚拟形象", "直播互动", "模型管理", "系统设置"]
+NAV_ITEMS = ["首页", "视频动捕", "音频变声", "虚拟形象", "直播互动", "模型管理", "系统设置", "云端管理"]
 
 
 STYLE_SHEET = """
@@ -148,6 +166,27 @@ QListWidget#modelList::item {
 QListWidget#modelList::item:selected {
     background-color: rgba(62, 145, 230, 70);
     color: #7EE7FF;
+}
+
+QTabWidget#modelTabs::pane {
+    border: none;
+}
+
+QTabWidget#modelTabs QTabBar::tab {
+    background: transparent;
+    color: #9DB5D8;
+    padding: 8px 18px;
+    border: none;
+    border-bottom: 2px solid transparent;
+}
+
+QTabWidget#modelTabs QTabBar::tab:selected {
+    color: #7EE7FF;
+    border-bottom: 2px solid #7EE7FF;
+}
+
+QTabWidget#modelTabs QTabBar::tab:hover {
+    color: #EAF6FF;
 }
 
 QPushButton#actionButton {
@@ -442,17 +481,27 @@ class HomeWindow(QMainWindow):
     profile_load_error = Signal(str)
     profile_saved = Signal(dict)
     profile_save_error = Signal(str)
+    cloud_models_loaded = Signal(list)
+    cloud_models_error = Signal(str)
+    cloud_action_done = Signal(str)
+    cloud_action_error = Signal(str)
+    cloud_presets_loaded = Signal(list)
+    cloud_presets_error = Signal(str)
 
-    def __init__(self, account: str | None = None) -> None:
+    def __init__(self, account: str | None = None, offline: bool = False) -> None:
         super().__init__()
-        self.account = account or ""
+        self.offline = bool(offline)
+        # Offline mode uses a dedicated local profile and never displays/reads
+        # the selected account's cloud content or per-account data.
+        self.account = LOCAL_PROFILE_DISPLAY if self.offline else (account or "")
         self.setWindowTitle("星弦")
         self.setMinimumSize(1024, 680)
         self.resize(1280, 800)
         self.setStyleSheet(STYLE_SHEET)
-        self.model_store = ModelStore(self.account)
+        store_account = LOCAL_PROFILE if self.offline else self.account
+        self.model_store = ModelStore(store_account)
         self.model_entries = self.model_store.load()
-        self.settings_store = SettingsStore(self.account)
+        self.settings_store = SettingsStore(store_account)
         self.motion_settings = self.settings_store.load_motion()
         self.motion_capture = MotionCapture()
         self.motion_capture.frame_ready.connect(self._on_motion_frame)
@@ -462,14 +511,23 @@ class HomeWindow(QMainWindow):
         self.motion_capture.set_drive_params(self.motion_settings.get("params", {}))
         self.profile_data: dict = {}
         self.personal_page_index = 0
+        self._avatar_running = False  # 模型预览是否处于启动（显示）状态
+        self._avatar_running_before_capture = False  # 动捕开始前模型是否已启动
 
         icon_path = ICON_PATH if ICON_PATH.exists() else LOGO_PATH
         self.setWindowIcon(QIcon(str(icon_path)))
         self.setCentralWidget(self._build_ui())
+        self._sync_preview_views()
         self.profile_loaded.connect(self._on_profile_loaded)
         self.profile_load_error.connect(self._on_profile_load_error)
         self.profile_saved.connect(self._on_profile_saved)
         self.profile_save_error.connect(self._on_profile_save_error)
+        self.cloud_models_loaded.connect(self._on_cloud_models_loaded)
+        self.cloud_models_error.connect(self._on_cloud_models_error)
+        self.cloud_action_done.connect(self._on_cloud_action_done)
+        self.cloud_action_error.connect(self._on_cloud_action_error)
+        self.cloud_presets_loaded.connect(self._on_cloud_presets_loaded)
+        self.cloud_presets_error.connect(self._on_cloud_presets_error)
 
     def closeEvent(self, event: QCloseEvent) -> None:
         self._shutdown_live2d()
@@ -561,6 +619,8 @@ class HomeWindow(QMainWindow):
                 page = self._build_model_management_page()
             elif index == 6:
                 page = self._build_system_settings_page()
+            elif index == 7:
+                page = self._build_cloud_management_page()
             else:
                 page = _make_simple_page(name)
             self.pages.addWidget(page)
@@ -602,6 +662,10 @@ class HomeWindow(QMainWindow):
             self.nav_group.buttons()[index].setChecked(True)
         self.nav_group.setExclusive(True)
         self._place_live2d_for_page(index)
+        self._sync_preview_views()
+        if index == 7:
+            self._refresh_cloud_models()
+            self._refresh_cloud_presets()
         if index == self.personal_page_index:
             self._load_profile()
 
@@ -611,13 +675,26 @@ class HomeWindow(QMainWindow):
             return
         if index == 0:
             holder = getattr(self, "home_preview_holder", None)
+            vrm_host = getattr(self, "avatar_preview_holder", None)
         elif index == 1:
             holder = getattr(self, "motion_avatar_holder", None)
+            vrm_host = getattr(self, "motion_avatar_holder", None)
         elif index == 3:
             holder = getattr(self, "avatar_preview_holder", None)
+            vrm_host = getattr(self, "avatar_preview_holder", None)
         else:
             return
         if holder is None:
+            return
+        self._move_view_to(view, holder)
+        vrm_view = getattr(self, "avatar_vrm_view", None)
+        if vrm_view is not None:
+            self._move_view_to(vrm_view, vrm_host)
+
+    @staticmethod
+    def _move_view_to(view, holder) -> None:
+        """把一个模型视图移到指定预览容器，保证只在该容器内显示。"""
+        if view is None or holder is None:
             return
         current = view.parentWidget()
         if current is holder:
@@ -625,8 +702,77 @@ class HomeWindow(QMainWindow):
         if current is not None and current.layout() is not None:
             current.layout().removeWidget(view)
         view.setParent(holder)
-        holder.layout().addWidget(view)
+        holder.layout().addWidget(view, 1)
         view.update()
+
+    def _sync_preview_views(self) -> None:
+        """保证每个预览区域同一时刻只展示一个模型视图，避免两种模型叠显。"""
+        index = self.pages.currentIndex() if hasattr(self, "pages") else -1
+        shared = getattr(self, "live2d_view", None)  # 全局唯一的 Live2D 渲染器
+        running = getattr(self, "_avatar_running", False)
+
+        if index == 0:
+            # 首页预览区：Live2D / VRM 二选一
+            shared_vrm = getattr(self, "vrm_view", None)
+            if shared is None or shared_vrm is None:
+                return
+            if not running:
+                shared.hide()
+                shared_vrm.hide()
+                return
+            model_type = "live2d"
+            if hasattr(self, "home_model_type_combo"):
+                model_type = self.home_model_type_combo.currentText().lower()
+            if model_type == "vrm":
+                shared.hide()
+                shared_vrm.show()
+            else:
+                shared.show()
+                shared_vrm.hide()
+        elif index == 1:
+            # 动捕页：按当前模型类型显示 Live2D / VRM 二选一
+            avatar_vrm = getattr(self, "avatar_vrm_view", None)
+            if shared is None:
+                return
+            if not running:
+                shared.hide()
+                if avatar_vrm is not None:
+                    avatar_vrm.hide()
+                return
+            model_type = "live2d"
+            if hasattr(self, "avatar_model_type_combo"):
+                model_type = self.avatar_model_type_combo.currentText().lower()
+            if model_type == "vrm" and avatar_vrm is not None:
+                avatar_vrm.show()
+                shared.hide()
+            else:
+                shared.show()
+                if avatar_vrm is not None:
+                    avatar_vrm.hide()
+        elif index == 3:
+            # 虚拟形象页：Live2D / VRM 二选一；本页的 avatar_live2d_view 无模型，始终隐藏
+            avatar_live2d = getattr(self, "avatar_live2d_view", None)
+            avatar_vrm = getattr(self, "avatar_vrm_view", None)
+            if avatar_vrm is None:
+                return
+            if avatar_live2d is not None:
+                avatar_live2d.hide()
+            if not running:
+                avatar_vrm.hide()
+                if shared is not None:
+                    shared.hide()
+                return
+            model_type = "live2d"
+            if hasattr(self, "avatar_model_type_combo"):
+                model_type = self.avatar_model_type_combo.currentText().lower()
+            if model_type == "vrm":
+                avatar_vrm.show()
+                if shared is not None:
+                    shared.hide()
+            else:
+                avatar_vrm.hide()
+                if shared is not None:
+                    shared.show()
 
     def _build_motion_page(self) -> QWidget:
         page = QWidget()
@@ -679,6 +825,12 @@ class HomeWindow(QMainWindow):
         self.motion_mirror.setChecked(bool(self.motion_settings.get("mirror", True)))
         self.motion_mirror.toggled.connect(self._on_motion_mirror_changed)
         controls_box.addWidget(self.motion_mirror)
+
+        self.motion_lr_mirror = QCheckBox("左右反转")
+        self.motion_lr_mirror.setObjectName("toggle")
+        self.motion_lr_mirror.setChecked(bool(self.motion_settings.get("lr_mirror", False)))
+        self.motion_lr_mirror.toggled.connect(self._on_motion_lr_mirror_changed)
+        controls_box.addWidget(self.motion_lr_mirror)
 
         sens_row = QHBoxLayout()
         sens_row.addWidget(self._form_label("灵敏度"))
@@ -886,6 +1038,7 @@ class HomeWindow(QMainWindow):
     def _apply_motion_settings(self) -> None:
         self.motion_capture.set_camera_index(int(self.motion_settings.get("camera_index", 0)))
         self.motion_capture.set_mirror(bool(self.motion_settings.get("mirror", True)))
+        self.motion_capture.set_lr_mirror(bool(self.motion_settings.get("lr_mirror", False)))
         self.motion_capture.set_sensitivity(float(self.motion_settings.get("sensitivity", 1.0)))
         self.motion_capture.set_drive_enabled(bool(self.motion_settings.get("drive_enabled", True)))
 
@@ -902,6 +1055,11 @@ class HomeWindow(QMainWindow):
         self.motion_capture.set_mirror(checked)
         self._save_motion_settings()
 
+    def _on_motion_lr_mirror_changed(self, checked: bool) -> None:
+        self.motion_settings["lr_mirror"] = checked
+        self.motion_capture.set_lr_mirror(checked)
+        self._save_motion_settings()
+
     def _on_motion_sensitivity_changed(self, value: float) -> None:
         self.motion_settings["sensitivity"] = value
         self.motion_capture.set_sensitivity(value)
@@ -916,9 +1074,16 @@ class HomeWindow(QMainWindow):
 
     def _on_motion_start(self) -> None:
         self._apply_motion_settings()
+        self._avatar_running_before_capture = getattr(self, "_avatar_running", False)
         if self.motion_capture.start():
             self.motion_start_button.setEnabled(False)
             self.motion_status.setText("动捕运行中")
+            # 动捕期间让头像保持显示并可被驱动；若此前未启动，结束后回退
+            self._avatar_running = True
+            model_type = self.avatar_model_type_combo.currentText().lower() if hasattr(self, "avatar_model_type_combo") else "live2d"
+            if model_type in ("live2d", "vrm"):
+                self._refresh_model_list(model_type)
+            self._sync_preview_views()
             if getattr(self, "live2d_view", None) is not None:
                 self.live2d_view.set_auto_features(blink=False, breath=True)
                 self.live2d_view.stop_motions()
@@ -927,6 +1092,11 @@ class HomeWindow(QMainWindow):
         self.motion_capture.stop()
         self.motion_start_button.setEnabled(True)
         self.motion_status.setText("动捕已停止")
+        # 若动捕前模型未启动，则停止后回退到未启动状态
+        if not getattr(self, "_avatar_running_before_capture", False):
+            self._avatar_running = False
+            self._sync_live2d_views()
+        self._sync_preview_views()
         if getattr(self, "live2d_view", None) is not None:
             self.live2d_view.set_auto_features(blink=True, breath=True)
             self.live2d_view.reset_drive()
@@ -951,8 +1121,18 @@ class HomeWindow(QMainWindow):
             label.setPixmap(pixmap)
 
     def _on_motion_drive(self, drive: dict) -> None:
-        if getattr(self, "live2d_view", None) is not None:
-            self.live2d_view.apply_drive(**drive)
+        # 根据当前模型类型传递动捕数据
+        model_type = self.avatar_model_type_combo.currentText().lower() if hasattr(self, "avatar_model_type_combo") else "live2d"
+        
+        if model_type == "live2d":
+            if getattr(self, "live2d_view", None) is not None:
+                self.live2d_view.apply_drive(**drive)
+            elif getattr(self, "avatar_live2d_view", None) is not None:
+                self.avatar_live2d_view.apply_drive(**drive)
+        elif model_type == "vrm":
+            if getattr(self, "avatar_vrm_view", None) is not None:
+                self.avatar_vrm_view.set_drive_params(**drive)
+        
         for key, label in getattr(self, "motion_value_labels", {}).items():
             label.setText(f"{drive.get(key, 0.0):.1f}")
 
@@ -1006,6 +1186,26 @@ class HomeWindow(QMainWindow):
         self.live2d_view.model_loaded.connect(self._on_live2d_loaded)
         self.live2d_view.model_error.connect(self._on_live2d_error)
         home_holder_layout.addWidget(self.live2d_view, 1)
+        
+        # VRM 视图支持
+        self.vrm_view = VRMView()
+        self.vrm_view.model_loaded.connect(self._on_vrm_loaded)
+        self.vrm_view.model_error.connect(self._on_vrm_error)
+        home_holder_layout.addWidget(self.vrm_view, 1)
+        self.vrm_view.hide()  # 默认隐藏，根据模型类型切换显示
+        
+        # 模型类型切换器
+        home_model_type_layout = QHBoxLayout()
+        home_model_type_layout.setSpacing(8)
+        self.home_model_type_combo = QComboBox()
+        self.home_model_type_combo.setObjectName("navButton")
+        self.home_model_type_combo.addItems(["Live2D", "VRM"])
+        self.home_model_type_combo.currentTextChanged.connect(self._on_home_model_type_changed)
+        home_model_type_layout.addWidget(QLabel("模型类型："))
+        home_model_type_layout.addWidget(self.home_model_type_combo)
+        home_model_type_layout.addStretch()
+        avatar_box.addLayout(home_model_type_layout)
+        
         avatar_box.addWidget(self.home_preview_holder, 1)
         self.home_avatar_status = QLabel("")
         self.home_avatar_status.setObjectName("panelBody")
@@ -1093,6 +1293,21 @@ class HomeWindow(QMainWindow):
         avatar_holder_layout = QVBoxLayout(self.avatar_preview_holder)
         avatar_holder_layout.setContentsMargins(8, 8, 8, 8)
         avatar_holder_layout.setSpacing(0)
+        
+        # Live2D 视图
+        self.avatar_live2d_view = Live2DView()
+        self.avatar_live2d_view.model_loaded.connect(self._on_avatar_live2d_loaded)
+        self.avatar_live2d_view.model_error.connect(self._on_avatar_live2d_error)
+        avatar_holder_layout.addWidget(self.avatar_live2d_view, 1)
+        self.avatar_live2d_view.hide()  # 始终隐藏，避免与共享 Live2D 视图叠显
+        
+        # VRM 视图
+        self.avatar_vrm_view = VRMView()
+        self.avatar_vrm_view.model_loaded.connect(self._on_avatar_vrm_loaded)
+        self.avatar_vrm_view.model_error.connect(self._on_avatar_vrm_error)
+        avatar_holder_layout.addWidget(self.avatar_vrm_view, 1)
+        self.avatar_vrm_view.hide()  # 默认隐藏
+        
         stage_layout.addWidget(self.avatar_preview_holder, 1)
         content.addWidget(stage, 2)
 
@@ -1106,6 +1321,18 @@ class HomeWindow(QMainWindow):
         picker_title = QLabel("模型选择")
         picker_title.setObjectName("panelTitle")
         picker_layout.addWidget(picker_title)
+        
+        # 模型类型切换器
+        model_type_layout = QHBoxLayout()
+        model_type_layout.setSpacing(8)
+        self.avatar_model_type_combo = QComboBox()
+        self.avatar_model_type_combo.setObjectName("navButton")
+        self.avatar_model_type_combo.addItems(["Live2D", "VRM"])
+        self.avatar_model_type_combo.currentTextChanged.connect(self._on_avatar_model_type_changed)
+        model_type_layout.addWidget(QLabel("模型类型："))
+        model_type_layout.addWidget(self.avatar_model_type_combo)
+        model_type_layout.addStretch()
+        picker_layout.addLayout(model_type_layout)
 
         self.avatar_model_list = QListWidget()
         self.avatar_model_list.setObjectName("modelList")
@@ -1114,13 +1341,17 @@ class HomeWindow(QMainWindow):
 
         buttons = QHBoxLayout()
         buttons.setSpacing(8)
-        show_button = QPushButton("显示")
-        show_button.setObjectName("actionButton")
-        show_button.clicked.connect(lambda _=False: self._show_avatar_model())
+        start_button = QPushButton("启动")
+        start_button.setObjectName("actionButton")
+        start_button.clicked.connect(lambda _=False: self._start_avatar())
+        stop_button = QPushButton("停止")
+        stop_button.setObjectName("actionButton")
+        stop_button.clicked.connect(lambda _=False: self._stop_avatar())
         reload_button = QPushButton("重新加载")
         reload_button.setObjectName("actionButton")
         reload_button.clicked.connect(lambda _=False: self._reload_live2d())
-        buttons.addWidget(show_button)
+        buttons.addWidget(start_button)
+        buttons.addWidget(stop_button)
         buttons.addWidget(reload_button)
         buttons.addStretch()
         picker_layout.addLayout(buttons)
@@ -1135,7 +1366,12 @@ class HomeWindow(QMainWindow):
         right_column = QVBoxLayout()
         right_column.setSpacing(14)
         right_column.addWidget(picker)
-        right_column.addWidget(self._build_drive_params_card(), 1)
+        self.drive_params_card_holder = QWidget()
+        holder_layout = QVBoxLayout(self.drive_params_card_holder)
+        holder_layout.setContentsMargins(0, 0, 0, 0)
+        holder_layout.setSpacing(0)
+        holder_layout.addWidget(self._build_drive_params_card(), 1)
+        right_column.addWidget(self.drive_params_card_holder, 1)
         return right_column
 
     def _active_live2d_entry(self):
@@ -1154,6 +1390,7 @@ class HomeWindow(QMainWindow):
                 label.setText(text)
         # 模型加载后更新参数面板
         if ok:
+            self._sync_preview_views()
             self._refresh_drive_params_card()
 
     def _on_live2d_error(self, message: str) -> None:
@@ -1162,6 +1399,32 @@ class HomeWindow(QMainWindow):
             label = getattr(self, attr, None)
             if label is not None:
                 label.setText(text)
+
+    def _on_vrm_loaded(self, ok: bool) -> None:
+        active = self._active_vrm_entry()
+        name = active.name if active else "VRM模型"
+        text = f"正在显示：{name}" if ok else "当前未显示VRM模型"
+        for attr in ("home_avatar_status", "avatar_status"):
+            label = getattr(self, attr, None)
+            if label is not None:
+                label.setText(text)
+        # 模型加载后更新参数面板
+        if ok:
+            self._sync_preview_views()
+            self._refresh_drive_params_card()
+
+    def _on_vrm_error(self, message: str) -> None:
+        text = f"VRM模型加载失败：{message}"
+        for attr in ("home_avatar_status", "avatar_status"):
+            label = getattr(self, attr, None)
+            if label is not None:
+                label.setText(text)
+
+    def _active_vrm_entry(self):
+        for entry in self.model_entries:
+            if entry.kind == "vrm" and entry.active:
+                return entry
+        return None
 
     def _active_rvc_entry(self):
         for entry in self.model_entries:
@@ -1175,36 +1438,95 @@ class HomeWindow(QMainWindow):
         name = active.name if active else ""
         view = getattr(self, "live2d_view", None)
         if view is not None:
-            if path:
-                view.load_model(path)
+            if path and getattr(self, "_avatar_running", False):
+                # 检查文件格式，防止 VRM 文件被 Live2D 加载器处理
+                if path.lower().endswith('.vrm'):
+                    # VRM 文件应该使用 VRM 视图，这里清空 Live2D 视图
+                    view.clear_model()
+                    text = f"检测到 VRM 模型文件，请使用 VRM 视图加载：{name}"
+                else:
+                    try:
+                        view.load_model(path)
+                        text = f"当前模型：{name}"
+                    except Exception as e:
+                        # 加载失败时安全回退到空白预览
+                        view.clear_model()
+                        text = f"模型加载失败：{e}"
             else:
                 view.clear_model()
-        text = f"当前模型：{name}" if path else "暂无模型，请先在模型管理中导入并启用 Live2D 模型"
+                text = ("已停止" if not getattr(self, "_avatar_running", False)
+                        else "暂无模型，请先在模型管理中导入并启用 Live2D 模型")
+        else:
+            text = "暂无模型，请先在模型管理中导入并启用 Live2D 模型"
+        
         for status_attr in ("home_avatar_status", "avatar_status"):
             label = getattr(self, status_attr, None)
             if label is not None:
                 label.setText(text)
 
-    def _refresh_live2d_page(self) -> None:
+    def _refresh_avatar_model_list(self) -> None:
+        """按当前模型类型刷新虚拟形象页列表；仅模型已启动时标记[使用中]。"""
         if getattr(self, "avatar_model_list", None) is None:
             return
         self.avatar_model_list.clear()
+        model_type = "live2d"
+        if hasattr(self, "avatar_model_type_combo"):
+            model_type = self.avatar_model_type_combo.currentText().lower()
+        running = getattr(self, "_avatar_running", False)
         for entry in self.model_entries:
-            if entry.kind != "live2d":
+            if entry.kind != model_type:
                 continue
-            suffix = " [使用中]" if entry.active else ""
+            suffix = " [使用中]" if (entry.active and running) else ""
             self.avatar_model_list.addItem(f"{entry.name}{suffix}")
+
+    def _refresh_live2d_page(self) -> None:
+        self._refresh_avatar_model_list()
         self._sync_live2d_views()
 
-    def _show_avatar_model(self) -> None:
+    def _start_avatar(self) -> None:
+        """启动并显示当前选中的模型，预览不再自动加载，需手动启动。"""
         if self.avatar_model_list.currentItem() is None:
             show_info(self, "星弦", "请先选择一个模型")
             return
         name = self.avatar_model_list.currentItem().text().split(" [")[0]
-        self.model_entries = self.model_store.set_active("live2d", name)
-        self._refresh_model_list("live2d")
+        model_type = self.avatar_model_type_combo.currentText().lower()
+        self._avatar_running = True
+
+        if model_type == "live2d":
+            self.model_entries = self.model_store.set_active("live2d", name)
+            self._refresh_model_list("live2d")
+        elif model_type == "vrm":
+            self.model_entries = self.model_store.set_active("vrm", name)
+            self._refresh_model_list("vrm")
+
+        self._sync_preview_views()
+        self.avatar_status.setText(f"已启动：{name}")
+
+    def _stop_avatar(self) -> None:
+        """停止模型预览，清除视图并隐藏，不再一直显示。"""
+        self._avatar_running = False
+        for view in (
+            getattr(self, "live2d_view", None),
+            getattr(self, "vrm_view", None),
+            getattr(self, "avatar_vrm_view", None),
+            getattr(self, "avatar_live2d_view", None),
+        ):
+            if view is not None:
+                try:
+                    view.clear_model()
+                except Exception:
+                    pass
+        self._refresh_avatar_model_list()
+        self._sync_preview_views()
+        for attr in ("home_avatar_status", "avatar_status"):
+            label = getattr(self, attr, None)
+            if label is not None:
+                label.setText("已停止")
 
     def _reload_live2d(self) -> None:
+        if not getattr(self, "_avatar_running", False):
+            show_info(self, "星弦", "请先启动模型")
+            return
         active = self._active_live2d_entry()
         if active is None:
             show_info(self, "星弦", "当前没有可显示的模型")
@@ -1212,74 +1534,117 @@ class HomeWindow(QMainWindow):
         self._sync_live2d_views()
         self.avatar_status.setText(f"正在重新加载：{active.name}")
 
+    def _on_avatar_model_type_changed(self, model_type: str) -> None:
+        """模型类型切换回调"""
+        if model_type == "Live2D":
+            self._refresh_model_list("live2d")
+        elif model_type == "VRM":
+            self._refresh_model_list("vrm")
+        self._sync_preview_views()
+        self._refresh_drive_params_card()
+
+    def _on_home_model_type_changed(self, model_type: str) -> None:
+        """home 页面模型类型切换回调"""
+        self._sync_preview_views()
+
+    def _on_avatar_live2d_loaded(self, ok: bool) -> None:
+        """Live2D 模型加载成功回调"""
+        active = self._active_live2d_entry()
+        name = active.name if active else "Live2D模型"
+        text = f"当前 Live2D 模型：{name}" if ok else "当前未显示 Live2D 模型"
+        self.avatar_status.setText(text)
+        if ok:
+            self._sync_preview_views()
+            self._refresh_drive_params_card()
+
+    def _on_avatar_live2d_error(self, message: str) -> None:
+        """Live2D 模型加载失败回调"""
+        self.avatar_status.setText(f"Live2D 模型加载失败：{message}")
+
+    def _on_avatar_vrm_loaded(self, ok: bool) -> None:
+        """VRM 模型加载成功回调"""
+        active = self._active_vrm_entry()
+        name = active.name if active else "VRM模型"
+        text = f"当前 VRM 模型：{name}" if ok else "当前未显示 VRM 模型"
+        self.avatar_status.setText(text)
+        if ok:
+            self._sync_preview_views()
+            self._refresh_drive_params_card()
+
+    def _on_avatar_vrm_error(self, message: str) -> None:
+        """VRM 模型加载失败回调"""
+        self.avatar_status.setText(f"VRM 模型加载失败：{message}")
+
     def _build_drive_params_card(self) -> QFrame:
         card, box = _make_card("模型参数设置")
-        hint = QLabel("幅度越大动作越明显；勾选反转可颠倒方向。")
+        hint = QLabel("仅显示当前模型支持的参数；幅度越大动作越明显。")
         hint.setObjectName("hintText")
         box.addWidget(hint)
 
         self.drive_param_spins: dict[str, QDoubleSpinBox] = {}
         self.drive_param_inverts: dict[str, QCheckBox] = {}
         params = self.motion_settings.get("params", {})
+        supported = self._supported_params_for_current()
 
-        # 获取当前模型支持的参数
-        supported_params = []
-        if hasattr(self, "home_live2d_view") and self.home_live2d_view is not None:
-            supported_params = self.home_live2d_view.get_supported_params()
-        elif hasattr(self, "avatar_live2d_view") and self.avatar_live2d_view is not None:
-            supported_params = self.avatar_live2d_view.get_supported_params()
+        # 不支持的参数不显示，避免白白调整无效项
+        no_invert = {"eye_open_l", "eye_open_r", "mouth_open", "eye", "mouth"}
+        rows = [(p.name, p.id, p.id not in no_invert) for p in supported]
 
-        # 如果没有模型支持参数，使用默认参数列表
-        if not supported_params:
-            rows = [
-                ("头部左右", "angle_x", True),
-                ("头部上下", "angle_y", True),
-                ("头部翻转", "angle_z", True),
-                ("身体左右", "body_angle_x", True),
-                ("身体前后", "body_angle_y", True),
-                ("左臂", "arm_l", True),
-                ("右臂", "arm_r", True),
-                ("眼睛", "eye", False),
-                ("嘴型", "mouth", False),
-                ("眼球左右", "eye_x", True),
-                ("眼球上下", "eye_y", True),
-            ]
-        else:
-            # 根据模型支持的参数生成行
-            rows = []
-            for param in supported_params:
-                rows.append((param.name, param.id, True))
+        # 状态与刷新：方便确认当前模型已识别出哪些可调参数
+        refresh_row = QHBoxLayout()
+        refresh_row.setSpacing(8)
+        self.drive_params_status = QLabel(
+            f"已检测到 {len(rows)} 个可调参数" if rows
+            else "未检测到可调参数，请先启动模型"
+        )
+        self.drive_params_status.setObjectName("hintText")
+        self.drive_params_status.setWordWrap(True)
+        refresh_row.addWidget(self.drive_params_status, 1)
+        refresh_button = QPushButton("刷新")
+        refresh_button.setObjectName("ghostButton")
+        refresh_button.setFixedWidth(64)
+        refresh_button.setFixedHeight(28)
+        refresh_button.clicked.connect(self._on_drive_params_refresh)
+        refresh_row.addWidget(refresh_button)
+        box.addLayout(refresh_row)
 
         grid = QGridLayout()
         grid.setContentsMargins(0, 0, 0, 0)
         grid.setHorizontalSpacing(12)
         grid.setVerticalSpacing(6)
-        for col, text in enumerate(("参数", "幅度", "反转")):
-            head = QLabel(text)
-            head.setObjectName("hintText")
-            grid.addWidget(head, 0, col)
+        if rows:
+            for col, text in enumerate(("参数", "幅度", "反转")):
+                head = QLabel(text)
+                head.setObjectName("hintText")
+                grid.addWidget(head, 0, col)
 
-        for row, (label, key, has_invert) in enumerate(rows, start=1):
-            name = QLabel(label)
-            name.setObjectName("hintText")
-            grid.addWidget(name, row, 0)
-            spin = QDoubleSpinBox()
-            spin.setObjectName("paramSpin")
-            spin.setRange(0.0, 3.0)
-            spin.setSingleStep(0.1)
-            spin.setValue(float(params.get(key, {}).get("mult", 1.0)))
-            spin.valueChanged.connect(lambda value, k=key: self._on_drive_param_mult(k, value))
-            grid.addWidget(spin, row, 1)
-            self.drive_param_spins[key] = spin
-            if has_invert:
-                invert = QCheckBox()
-                invert.setObjectName("toggle")
-                invert.setChecked(bool(params.get(key, {}).get("invert", False)))
-                invert.toggled.connect(lambda checked, k=key: self._on_drive_param_invert(k, checked))
-                grid.addWidget(invert, row, 2)
-                self.drive_param_inverts[key] = invert
-            else:
-                grid.addWidget(QLabel(""), row, 2)
+            for row, (label, key, has_invert) in enumerate(rows, start=1):
+                name = QLabel(label)
+                name.setObjectName("hintText")
+                grid.addWidget(name, row, 0)
+                spin = QDoubleSpinBox()
+                spin.setObjectName("paramSpin")
+                spin.setRange(0.0, 3.0)
+                spin.setSingleStep(0.1)
+                spin.setValue(float(params.get(key, {}).get("mult", 1.0)))
+                spin.valueChanged.connect(lambda value, k=key: self._on_drive_param_mult(k, value))
+                grid.addWidget(spin, row, 1)
+                self.drive_param_spins[key] = spin
+                if has_invert:
+                    invert = QCheckBox()
+                    invert.setObjectName("toggle")
+                    invert.setChecked(bool(params.get(key, {}).get("invert", False)))
+                    invert.toggled.connect(lambda checked, k=key: self._on_drive_param_invert(k, checked))
+                    grid.addWidget(invert, row, 2)
+                    self.drive_param_inverts[key] = invert
+                else:
+                    grid.addWidget(QLabel(""), row, 2)
+        else:
+            empty = QLabel("该模型暂无已识别的驱动参数，请先启动模型以自动检测。")
+            empty.setObjectName("hintText")
+            empty.setWordWrap(True)
+            grid.addWidget(empty, 0, 0, 1, 3)
+
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
@@ -1294,21 +1659,43 @@ class HomeWindow(QMainWindow):
         box.addStretch()
         return card
 
+    def _supported_params_for_current(self) -> list:
+        """按当前模型类型，从实际加载的模型视图中读取其支持的参数。"""
+        model_type = self.avatar_model_type_combo.currentText().lower() if hasattr(self, "avatar_model_type_combo") else "live2d"
+        if model_type == "live2d":
+            view = getattr(self, "live2d_view", None)
+        elif model_type == "vrm":
+            view = getattr(self, "avatar_vrm_view", None)
+        else:
+            view = None
+        if view is None:
+            return []
+        try:
+            params = view.get_supported_params()
+            if isinstance(params, list):
+                return params
+        except Exception:
+            return []
+        return []
+
+    def _on_drive_params_refresh(self) -> None:
+        """手动刷新参数面板，重新检测当前模型支持的参数。"""
+        self._refresh_drive_params_card()
+
     def _refresh_drive_params_card(self) -> None:
         """刷新参数面板，根据当前模型支持的参数重新生成"""
-        # 保存当前参数值
-        current_params = self.motion_settings.get("params", {})
-        
-        # 重新构建参数面板
-        if hasattr(self, "drive_params_card_holder"):
-            # 清除旧的参数面板
-            layout = self.drive_params_card_holder.layout()
-            if layout:
-                while layout.count():
-                    item = layout.takeAt(0)
-                    if item.widget():
-                        item.widget().deleteLater()
-                layout.addWidget(self._build_drive_params_card())
+        holder = getattr(self, "drive_params_card_holder", None)
+        if holder is None:
+            return
+        layout = holder.layout()
+        if layout is None:
+            return
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        layout.addWidget(self._build_drive_params_card(), 1)
 
     def _on_drive_param_mult(self, key: str, value: float) -> None:
         params = self.motion_settings.setdefault("params", {})
@@ -1476,6 +1863,9 @@ class HomeWindow(QMainWindow):
         username = self.account
         if not username:
             return
+        if self.offline:
+            self._set_profile_status("离线模式，使用本地配置")
+            return
         self._set_profile_status("正在加载个人信息...")
 
         def worker() -> None:
@@ -1529,6 +1919,9 @@ class HomeWindow(QMainWindow):
 
     def _save_profile(self) -> None:
         if getattr(self, "profile_nickname_edit", None) is None:
+            return
+        if self.offline:
+            self._set_profile_status("离线模式使用独立本地配置，不修改在线账户信息", ok=False)
             return
         username = self.account
         nickname = self.profile_nickname_edit.text().strip()
@@ -1670,7 +2063,14 @@ class HomeWindow(QMainWindow):
         title_label = QLabel(title)
         title_label.setObjectName("pageTitle")
         layout.addWidget(title_label)
+        layout.addWidget(self._build_model_tab(kind), 1)
+        return page
 
+    def _build_model_tab(self, kind: str) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
         self.model_lists = getattr(self, "model_lists", {})
         model_list = QListWidget()
         model_list.setObjectName("modelList")
@@ -1682,6 +2082,9 @@ class HomeWindow(QMainWindow):
         import_button = QPushButton("导入模型")
         import_button.setObjectName("navButton")
         import_button.clicked.connect(lambda _=False, k=kind: self._import_model(k))
+        rename_button = QPushButton("重命名")
+        rename_button.setObjectName("navButton")
+        rename_button.clicked.connect(lambda _=False, k=kind: self._rename_model(k))
         use_button = QPushButton("使用")
         use_button.setObjectName("navButton")
         use_button.clicked.connect(lambda _=False, k=kind: self._use_model(k))
@@ -1689,13 +2092,14 @@ class HomeWindow(QMainWindow):
         delete_button.setObjectName("navButton")
         delete_button.clicked.connect(lambda _=False, k=kind: self._delete_model(k))
         buttons.addWidget(import_button)
+        buttons.addWidget(rename_button)
         buttons.addWidget(use_button)
         buttons.addWidget(delete_button)
         buttons.addStretch()
         layout.addLayout(buttons)
 
         self._refresh_model_list(kind)
-        return page
+        return tab
 
     def _build_model_management_page(self) -> QWidget:
         page = QWidget()
@@ -1706,20 +2110,502 @@ class HomeWindow(QMainWindow):
         title_label = QLabel("模型管理")
         title_label.setObjectName("pageTitle")
         layout.addWidget(title_label)
-        layout.addWidget(self._build_model_page("live2d", "Live2D 模型"))
-        layout.addWidget(self._build_model_page("rvc", "RVC 模型"))
+
+        tabs = QTabWidget()
+        tabs.setObjectName("modelTabs")
+        for kind, label in (("live2d", "Live2D 模型"), ("vrm", "VRM 模型"), ("rvc", "RVC 模型")):
+            tabs.addTab(self._build_model_tab(kind), label)
+        layout.addWidget(tabs, 1)
         return page
+
+    def _build_cloud_management_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(28, 24, 28, 24)
+        layout.setSpacing(14)
+
+        title_label = QLabel("云端管理")
+        title_label.setObjectName("pageTitle")
+        layout.addWidget(title_label)
+
+        self.cloud_all_models: list[dict] = []
+        self.cloud_models: list[dict] = []
+        self.cloud_presets: list[dict] = []
+        self.cloud_status = QLabel("")
+        self.cloud_status.setObjectName("panelBody")
+        self.cloud_status.setWordWrap(True)
+        layout.addWidget(self.cloud_status)
+
+        if self.offline:
+            offline_hint = QLabel("当前为离线模式，无法访问云端，联网登录后可上传 / 下载模型。")
+            offline_hint.setObjectName("hintText")
+            offline_hint.setWordWrap(True)
+            layout.addWidget(offline_hint)
+
+        tabs = QTabWidget()
+        tabs.setObjectName("cloudTabs")
+        tabs.addTab(self._build_cloud_model_tab(), "云模型")
+        tabs.addTab(self._build_cloud_preset_tab(), "云端方案")
+        layout.addWidget(tabs, 1)
+        return page
+
+    def _build_cloud_model_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
+
+        toolbar = QHBoxLayout()
+        toolbar.setSpacing(8)
+        toolbar.addWidget(self._form_label("模型类型"))
+        self.cloud_kind_combo = ArrowComboBox()
+        self.cloud_kind_combo.setObjectName("inputBox")
+        self.cloud_kind_combo.addItems(["Live2D", "VRM", "RVC"])
+        self.cloud_kind_combo.setFixedWidth(120)
+        self.cloud_kind_combo.currentTextChanged.connect(self._on_cloud_kind_changed)
+        toolbar.addWidget(self.cloud_kind_combo)
+        upload_button = QPushButton("上传模型")
+        upload_button.setObjectName("actionButton")
+        upload_button.clicked.connect(self._upload_cloud_model)
+        toolbar.addWidget(upload_button)
+        refresh_button = QPushButton("刷新")
+        refresh_button.setObjectName("ghostButton")
+        refresh_button.clicked.connect(self._refresh_cloud_models)
+        toolbar.addWidget(refresh_button)
+        toolbar.addStretch()
+        layout.addLayout(toolbar)
+
+        self.cloud_model_list = QListWidget()
+        self.cloud_model_list.setObjectName("modelList")
+        self.cloud_model_list.setSelectionMode(QAbstractItemView.SingleSelection)
+        layout.addWidget(self.cloud_model_list, 1)
+
+        actions = QHBoxLayout()
+        actions.setSpacing(8)
+        download_button = QPushButton("下载")
+        download_button.setObjectName("actionButton")
+        download_button.clicked.connect(lambda _=False: self._cloud_action("download"))
+        enable_button = QPushButton("启用")
+        enable_button.setObjectName("actionButton")
+        enable_button.clicked.connect(lambda _=False: self._cloud_action("enable"))
+        delete_button = QPushButton("删除")
+        delete_button.setObjectName("ghostButton")
+        delete_button.clicked.connect(lambda _=False: self._cloud_action("delete"))
+        actions.addWidget(download_button)
+        actions.addWidget(enable_button)
+        actions.addWidget(delete_button)
+        actions.addStretch()
+        layout.addLayout(actions)
+
+        return tab
+
+    def _build_cloud_preset_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
+
+        toolbar = QHBoxLayout()
+        toolbar.setSpacing(8)
+        toolbar.addWidget(self._form_label("方案类型"))
+        self.preset_kind_combo = ArrowComboBox()
+        self.preset_kind_combo.setObjectName("inputBox")
+        self.preset_kind_combo.addItems(["模型参数方案", "系统设置方案", "综合配置方案"])
+        self.preset_kind_combo.setFixedWidth(140)
+        self.preset_kind_combo.currentTextChanged.connect(self._on_preset_kind_changed)
+        toolbar.addWidget(self.preset_kind_combo)
+
+        self.preset_name_edit = QLineEdit()
+        self.preset_name_edit.setObjectName("inputBox")
+        self.preset_name_edit.setPlaceholderText("方案名称")
+        self.preset_name_edit.setFixedWidth(160)
+        toolbar.addWidget(self.preset_name_edit)
+
+        upload_button = QPushButton("上传当前方案")
+        upload_button.setObjectName("actionButton")
+        upload_button.clicked.connect(self._upload_current_preset)
+        toolbar.addWidget(upload_button)
+        refresh_button = QPushButton("刷新")
+        refresh_button.setObjectName("ghostButton")
+        refresh_button.clicked.connect(self._refresh_cloud_presets)
+        toolbar.addWidget(refresh_button)
+        toolbar.addStretch()
+        layout.addLayout(toolbar)
+
+        self.cloud_preset_list = QListWidget()
+        self.cloud_preset_list.setObjectName("modelList")
+        self.cloud_preset_list.setSelectionMode(QAbstractItemView.SingleSelection)
+        layout.addWidget(self.cloud_preset_list, 1)
+
+        actions = QHBoxLayout()
+        actions.setSpacing(8)
+        apply_button = QPushButton("下载应用")
+        apply_button.setObjectName("actionButton")
+        apply_button.clicked.connect(self._apply_cloud_preset)
+        delete_button = QPushButton("删除")
+        delete_button.setObjectName("ghostButton")
+        delete_button.clicked.connect(self._delete_cloud_preset)
+        actions.addWidget(apply_button)
+        actions.addWidget(delete_button)
+        actions.addStretch()
+        layout.addLayout(actions)
+
+        return tab
+
+    def _refresh_cloud_models(self) -> None:
+        if getattr(self, "cloud_model_list", None) is None:
+            return
+        if self.offline:
+            self._set_cloud_status("离线模式，无法访问云端", ok=False)
+            return
+        self._set_cloud_status("正在获取云端模型...")
+
+        def worker() -> None:
+            try:
+                data = list_cloud_models(self.account)
+            except CloudApiError as error:
+                self.cloud_models_error.emit(str(error))
+            else:
+                self.cloud_models_loaded.emit(data)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_cloud_models_loaded(self, data: list) -> None:
+        self.cloud_all_models = list(data)
+        self._render_cloud_models()
+
+    def _render_cloud_models(self) -> None:
+        """按当前模型类型过滤并刷新云端模型列表。"""
+        kind = self.cloud_kind_combo.currentText().lower() if hasattr(self, "cloud_kind_combo") else "live2d"
+        self.cloud_models = [item for item in self.cloud_all_models if item.get("kind") == kind]
+        self.cloud_model_list.clear()
+        if not self.cloud_models:
+            total = len(self.cloud_all_models)
+            if total == 0:
+                self._set_cloud_status("云端暂无模型")
+            else:
+                self._set_cloud_status(f"当前类型暂无云端模型（共 {total} 个）")
+            return
+        for item in self.cloud_models:
+            size_kb = float(item.get("size", 0)) / 1024.0
+            self.cloud_model_list.addItem(
+                f"{item.get('name', '')}  [{item.get('kind', '')}]  {size_kb:.1f} KB"
+            )
+        total = len(self.cloud_all_models)
+        if total != len(self.cloud_models):
+            self._set_cloud_status(f"显示 {len(self.cloud_models)} 个，共 {total} 个云端模型")
+        else:
+            self._set_cloud_status(f"共 {len(self.cloud_models)} 个云端模型")
+
+    def _on_cloud_kind_changed(self, _kind: str) -> None:
+        self._render_cloud_models()
+
+    def _on_cloud_models_error(self, message: str) -> None:
+        self._set_cloud_status(f"获取云端模型失败：{message}", ok=False)
+
+    def _on_cloud_action_done(self, message: str) -> None:
+        self._set_cloud_status(message)
+        self._refresh_cloud_models()
+        self._refresh_cloud_presets()
+
+    def _on_cloud_action_error(self, message: str) -> None:
+        self._set_cloud_status(message, ok=False)
+
+    @staticmethod
+    def _preset_kind_value(label: str) -> str:
+        return {
+            "模型参数方案": "param",
+            "系统设置方案": "system",
+            "综合配置方案": "config",
+        }.get(label, "config")
+
+    def _refresh_cloud_presets(self) -> None:
+        if getattr(self, "cloud_preset_list", None) is None:
+            return
+        if self.offline:
+            self._set_cloud_status("离线模式，无法访问云端", ok=False)
+            return
+        kind = self._preset_kind_value(self.preset_kind_combo.currentText())
+        self._set_cloud_status("正在获取云端方案...")
+
+        def worker() -> None:
+            try:
+                data = list_cloud_presets(self.account, kind)
+            except CloudApiError as error:
+                self.cloud_presets_error.emit(str(error))
+            else:
+                self.cloud_presets_loaded.emit(data)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_cloud_presets_loaded(self, data: list) -> None:
+        self.cloud_presets = list(data)
+        self._render_cloud_presets()
+
+    def _render_cloud_presets(self) -> None:
+        self.cloud_preset_list.clear()
+        if not self.cloud_presets:
+            self._set_cloud_status("云端暂无该类型方案")
+            return
+        for item in self.cloud_presets:
+            self.cloud_preset_list.addItem(item.get("name", ""))
+        total = len(self.cloud_presets)
+        self._set_cloud_status(f"共 {total} 个云端方案")
+
+    def _on_cloud_presets_error(self, message: str) -> None:
+        self._set_cloud_status(f"获取云端方案失败：{message}", ok=False)
+
+    def _on_preset_kind_changed(self, _label: str) -> None:
+        self._refresh_cloud_presets()
+
+    def _build_preset_content(self, kind: str) -> dict:
+        motion = self.motion_settings
+        if kind == "param":
+            return {"params": motion.get("params", {})}
+        if kind == "system":
+            return {
+                key: motion.get(key)
+                for key in ("camera_index", "mirror", "lr_mirror", "sensitivity", "engine", "drive_enabled")
+            }
+        return dict(motion)
+
+    def _upload_current_preset(self) -> None:
+        if self.offline:
+            self._set_cloud_status("离线模式，无法上传", ok=False)
+            return
+        name = self.preset_name_edit.text().strip()
+        if not name:
+            show_info(self, "星弦", "请输入方案名称")
+            return
+        kind = self._preset_kind_value(self.preset_kind_combo.currentText())
+        content = self._build_preset_content(kind)
+        payload = json.dumps(content, ensure_ascii=False)
+        self._set_cloud_status(f"正在上传方案 {name}...")
+
+        def worker() -> None:
+            try:
+                upload_cloud_preset(self.account, kind, name, payload)
+            except CloudApiError as error:
+                self.cloud_action_error.emit(str(error))
+            else:
+                self.cloud_action_done.emit(f"已上传方案：{name}")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_cloud_preset(self) -> None:
+        if self.offline:
+            self._set_cloud_status("离线模式，无法操作云端", ok=False)
+            return
+        index = self.cloud_preset_list.currentRow()
+        if index < 0 or index >= len(self.cloud_presets):
+            show_info(self, "星弦", "请先选择一个云端方案")
+            return
+        preset = self.cloud_presets[index]
+        name = preset.get("name", "")
+        try:
+            content = json.loads(preset.get("content", "{}"))
+        except (json.JSONDecodeError, TypeError):
+            show_warning(self, "星弦", "方案内容损坏，无法应用")
+            return
+        kind = preset.get("kind", "config")
+        self._apply_preset_content(kind, content)
+        show_info(self, "星弦", f"已应用方案：{name}")
+
+    def _apply_preset_content(self, kind: str, content: dict) -> None:
+        motion = self.motion_settings
+        if kind == "param":
+            params = content.get("params", {}) if isinstance(content, dict) else {}
+            motion["params"] = params
+        elif kind == "system":
+            for key in ("camera_index", "mirror", "lr_mirror", "sensitivity", "engine", "drive_enabled"):
+                if key in content:
+                    motion[key] = content[key]
+        else:
+            if isinstance(content, dict):
+                motion.update(content)
+        self._save_motion_settings()
+        self.motion_capture.set_drive_params(motion.get("params", {}))
+        self._refresh_drive_params_card()
+
+    def _delete_cloud_preset(self) -> None:
+        if self.offline:
+            self._set_cloud_status("离线模式，无法操作云端", ok=False)
+            return
+        index = self.cloud_preset_list.currentRow()
+        if index < 0 or index >= len(self.cloud_presets):
+            show_info(self, "星弦", "请先选择一个云端方案")
+            return
+        preset = self.cloud_presets[index]
+        name = preset.get("name", "")
+        answer = QMessageBox.question(
+            self,
+            "星弦",
+            f"确认删除云端方案 {name}？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self._set_cloud_status(f"正在删除方案 {name}...")
+
+        def worker() -> None:
+            try:
+                delete_cloud_preset(preset.get("id"), self.account)
+            except CloudApiError as error:
+                self.cloud_action_error.emit(str(error))
+            else:
+                self.cloud_action_done.emit(f"已删除方案：{name}")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _set_cloud_status(self, text: str, ok: bool = True) -> None:
+        label = getattr(self, "cloud_status", None)
+        if label is not None:
+            label.setText(text)
+            label.setStyleSheet("color: #7EE7FF;" if ok else "color: #FF7E7E;")
+
+    def _upload_cloud_model(self) -> None:
+        if self.offline:
+            self._set_cloud_status("离线模式，无法上传", ok=False)
+            return
+        kind = self.cloud_kind_combo.currentText().lower()
+        filters = {
+            "live2d": "Live2D (*.model3.json *.zip);;所有文件 (*)",
+            "vrm": "VRM (*.vrm);;所有文件 (*)",
+            "rvc": "RVC (*.pth *.index *.json);;所有文件 (*)",
+        }
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "上传模型到云端",
+            "",
+            filters.get(kind, "所有文件 (*)"),
+        )
+        if not path:
+            return
+        name = Path(path).stem
+        self._set_cloud_status("正在上传模型...")
+
+        def worker() -> None:
+            try:
+                upload_cloud_model(self.account, kind, name, path)
+            except CloudApiError as error:
+                self.cloud_action_error.emit(str(error))
+            else:
+                self.cloud_action_done.emit(f"已上传：{name}")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _cloud_action(self, action: str) -> None:
+        if self.offline:
+            self._set_cloud_status("离线模式，无法操作云端", ok=False)
+            return
+        index = self.cloud_model_list.currentRow()
+        if index < 0 or index >= len(self.cloud_models):
+            show_info(self, "星弦", "请先选择一个云端模型")
+            return
+        model = self.cloud_models[index]
+        model_id = model.get("id")
+        name = model.get("name", "")
+
+        if action == "delete":
+            answer = QMessageBox.question(
+                self,
+                "星弦",
+                f"确认删除云端模型 {name}？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            self._set_cloud_status(f"正在删除 {name}...")
+
+            def delete_worker() -> None:
+                try:
+                    delete_cloud_model(model_id, self.account)
+                except CloudApiError as error:
+                    self.cloud_action_error.emit(str(error))
+                else:
+                    self.cloud_action_done.emit(f"已删除：{name}")
+
+            threading.Thread(target=delete_worker, daemon=True).start()
+            return
+
+        if action == "download":
+            self._set_cloud_status(f"正在下载 {name}...")
+            self._download_and_import_cloud(model, enable=False)
+        elif action == "enable":
+            self._set_cloud_status(f"正在下载并启用 {name}...")
+            self._download_and_import_cloud(model, enable=True)
+
+    def _download_and_import_cloud(self, model: dict, enable: bool) -> None:
+        kind = model.get("kind", "")
+        original = model.get("originalFilename", "")
+        model_id = model.get("id")
+
+        def worker() -> None:
+            try:
+                content = download_cloud_model(model_id, self.account)
+            except CloudApiError as error:
+                self.cloud_action_error.emit(str(error))
+                return
+            try:
+                suffix = Path(original).suffix
+            except Exception:
+                suffix = ""
+            tmp = Path(self.model_store.models_dir) / f"_cloud_{model_id}{suffix}"
+            tmp.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                tmp.write_bytes(content)
+                if kind == "live2d":
+                    entry = self.model_store.import_live2d(tmp)
+                elif kind == "vrm":
+                    entry = self.model_store.import_vrm(tmp)
+                elif kind == "rvc":
+                    entry = self.model_store.import_rvc([tmp])
+                else:
+                    self.cloud_action_error.emit("不支持的模型类型")
+                    return
+            except Exception as error:
+                self.cloud_action_error.emit(f"导入本地模型失败：{error}")
+                return
+            finally:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+            self.model_entries = self.model_store.load()
+            if enable:
+                self.model_entries = self.model_store.set_active(kind, entry.name)
+            self._refresh_model_list(kind)
+            action_word = "启用" if enable else "下载"
+            self.cloud_action_done.emit(f"已{action_word}：{entry.name}")
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _refresh_model_list(self, kind: str) -> None:
         model_list = getattr(self, "model_lists", {}).get(kind)
         if model_list is not None:
             model_list.clear()
             entries = [entry for entry in self.model_entries if entry.kind == kind]
+            running = getattr(self, "_avatar_running", False)
             for entry in entries:
-                suffix = " [使用中]" if entry.active else ""
+                suffix = " [使用中]" if (entry.active and running) else ""
                 model_list.addItem(f"{entry.name}{suffix}")
         if kind == "live2d":
             self._refresh_live2d_page()
+        elif kind == "vrm":
+            self._refresh_vrm_page()
+
+    def _refresh_vrm_page(self) -> None:
+        """刷新 VRM 页面的模型列表"""
+        self._refresh_avatar_model_list()
+        # 只有在模型已启动时才加载到视图，否则清除避免残留显示
+        active = self._active_vrm_entry()
+        if active and hasattr(self, "avatar_vrm_view") and getattr(self, "_avatar_running", False):
+            self.avatar_vrm_view.load_model(active.path)
+        elif hasattr(self, "avatar_vrm_view"):
+            self.avatar_vrm_view.clear_model()
 
     def _import_model(self, kind: str) -> None:
         if kind == "live2d":
@@ -1732,6 +2618,20 @@ class HomeWindow(QMainWindow):
             if not path:
                 return
             self.model_store.import_live2d(Path(path))
+        elif kind == "vrm":
+            path, _ = QFileDialog.getOpenFileName(
+                self,
+                "选择 VRM 模型",
+                "",
+                "VRM (*.vrm);;所有文件 (*)",
+            )
+            if not path:
+                return
+            # 添加 VRM 导入方法（需要在 ModelStore 中实现）
+            if hasattr(self.model_store, 'import_vrm'):
+                self.model_store.import_vrm(Path(path))
+            else:
+                show_warning(self, "功能提示", "VRM 导入功能正在开发中")
         else:
             paths, _ = QFileDialog.getOpenFileNames(
                 self,
@@ -1755,6 +2655,27 @@ class HomeWindow(QMainWindow):
         self.model_entries = self.model_store.set_active(kind, name)
         self._refresh_model_list(kind)
         show_info(self, "星弦", f"已选择：{name}")
+
+    def _rename_model(self, kind: str) -> None:
+        model_list = getattr(self, "model_lists", {}).get(kind)
+        if model_list is None or model_list.currentItem() is None:
+            show_info(self, "星弦", "请先选择一个模型")
+            return
+        old_name = model_list.currentItem().text().split(" [")[0]
+        new_name, ok = QInputDialog.getText(
+            self,
+            "重命名模型",
+            "新的模型名称：",
+            text=old_name,
+        )
+        if not ok or not new_name or not new_name.strip():
+            return
+        new_name = new_name.strip()
+        if new_name == old_name:
+            return
+        self.model_entries = self.model_store.rename(kind, old_name, new_name)
+        self._refresh_model_list(kind)
+        show_info(self, "星弦", f"已重命名为：{new_name}")
 
     def _delete_model(self, kind: str) -> None:
         model_list = getattr(self, "model_lists", {}).get(kind)

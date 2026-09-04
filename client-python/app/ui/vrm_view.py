@@ -1,32 +1,23 @@
-"""VRM 模型视图实现。
+"""VRM 模型视图实现（完整可动皮套）。
 
-使用 pyglet 进行 3D 渲染，pyvrmlib 加载 VRM 模型。
-支持全身骨骼动画和表情。
+使用 pygltflib + numpy 解析 VRM/GLB，构建 humanoid 骨骼，把动捕驱动参数
+施加到骨骼/表情上，并在 CPU 完成蒙皮 + 形态键后上传到 GPU 渲染。
 """
 
 from __future__ import annotations
 
+import threading
+import traceback
 from pathlib import Path
 from typing import Any
 
-try:
-    import pyglet
-    from pyglet.gl import *
-    _PYGLET_AVAILABLE = True
-except Exception:
-    pyglet = None
-    _PYGLET_AVAILABLE = False
-
-try:
-    import pyvrmlib
-    _VRMLIB_AVAILABLE = True
-except Exception:
-    pyvrmlib = None
-    _VRMLIB_AVAILABLE = False
-
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QTimer, Qt
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
-from PySide6.QtWidgets import QWidget
+from OpenGL.GL import glViewport, glClear, glClearColor, GL_COLOR_BUFFER_BIT, GL_DEPTH_BUFFER_BIT
+
+from app.core.vrm.model import build as build_model
+from app.core.vrm.rig import VRMRig
+from app.core.vrm.renderer import VRMRenderer
 
 from app.ui.model_view_base import (
     ModelParam,
@@ -35,52 +26,86 @@ from app.ui.model_view_base import (
     ModelViewSignals,
 )
 
+# 常用表情（按偏好顺序，取模型里存在的那一个）
+_MOUTH_PRESETS = ("aa", "A", "a", "oh", "O", "ou", "u")
+_BLINK_PRESETS = ("blink", "Blink")
+_LOOK_PRESETS = ("lookLeft", "lookRight", "lookUp", "lookDown")
+
 
 class VRMView(QOpenGLWidget, ModelViewInterface):
-    """VRM 模型视图，支持 3D 全身渲染和骨骼动画"""
+    """VRM 模型视图：3D 全身渲染 + 骨骼动画 + 表情。"""
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
+        self.setMinimumSize(300, 360)
         self._signals = ModelViewSignals()
-        self._model = None
-        self._model_path: str | None = None
+        self._model = None          # VRMModel (parsed)
+        self._rig: VRMRig | None = None
+        self._renderer: VRMRenderer | None = None
+        self._pending_path: str | None = None
+        self._current_path: str | None = None
         self._gl_ready = False
         self._params: dict[str, ModelParam] = {}
-        self._bone_transforms: dict[str, Any] = {}
+        self._morph: dict[str, float] = {}
+        self._drive: dict[str, float] = {}
 
-    # ---- ModelViewInterface 实现 ----
+        # 动画计时
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self.update)
+        self._timer.start(33)  # ~30 FPS
 
+    # ---- ModelViewInterface ----
     def model_type(self) -> ModelType:
         return ModelType.VRM
 
+    def get_supported_params(self) -> list[ModelParam]:
+        return list(self._params.values())
+
     def load_model(self, path: str | Path) -> None:
-        """加载 VRM 模型"""
-        if not _PYGLET_AVAILABLE or not _VRMLIB_AVAILABLE:
-            self._signals.model_error.emit("VRM 依赖未安装，请安装 pyglet 和 pyvrmlib")
+        """加载 VRM 模型（解析 + 构建骨骼）。"""
+        self._pending_path = str(path) if path else None
+        if self._pending_path is None:
+            self.clear_model()
+            return
+        try:
+            model = build_model(self._pending_path)
+            rig = VRMRig(model)
+            rig.update()
+            self._model = model
+            self._rig = rig
+            self._detect_params()
+        except Exception as error:
+            traceback.print_exc()
+            self._model = None
+            self._rig = None
+            self._signals.model_loaded.emit(False)
+            self._signals.model_error.emit(f"解析 VRM 模型失败: {error}")
             return
 
-        try:
-            path_str = str(path)
-            self._model_path = path_str
-            self._model = pyvrmlib.load(path_str)
-            self._detect_params()
-            self._signals.model_loaded.emit(True)
-            self.update()
-        except Exception as e:
-            self._signals.model_error.emit(f"加载 VRM 模型失败: {e}")
-
-    def clear_model(self) -> None:
-        """清除模型"""
-        self._model = None
-        self._model_path = None
-        self._params.clear()
-        self._bone_transforms.clear()
-        self._signals.model_loaded.emit(False)
+        if self._gl_ready:
+            self._setup_renderer()
+        self._signals.model_loaded.emit(True)
         self.update()
 
-    def get_supported_params(self) -> list[ModelParam]:
-        """获取模型支持的参数列表"""
-        return list(self._params.values())
+    def clear_model(self) -> None:
+        self._pending_path = None
+        self._current_path = None
+        self._model = None
+        self._rig = None
+        self._morph.clear()
+        self._drive.clear()
+        if self._gl_ready and self._renderer is not None and self.isVisible():
+            self.makeCurrent()
+            try:
+                self._renderer.release()
+            except Exception:
+                pass
+            finally:
+                self.doneCurrent()
+        self._renderer = None
+        self._params.clear()
+        self._signals.model_loaded.emit(False)
+        self.update()
 
     def set_drive_params(
         self,
@@ -98,213 +123,125 @@ class VRMView(QOpenGLWidget, ModelViewInterface):
         mouth_open: float = 0.0,
         **kwargs: Any,
     ) -> None:
-        """设置动捕驱动参数，映射到 VRM 骨骼"""
-        if self._model is None:
-            return
-
-        # 头部旋转
-        self._set_bone_rotation("head", angle_x, angle_y, angle_z)
-
-        # 身体旋转
-        self._set_bone_rotation("spine", body_angle_x, body_angle_y, 0.0)
-        self._set_bone_rotation("chest", body_angle_x * 0.5, body_angle_y * 0.5, 0.0)
-
-        # 手臂旋转
-        self._set_bone_rotation("leftUpperArm", arm_l * 30.0, 0.0, 0.0)
-        self._set_bone_rotation("rightUpperArm", arm_r * 30.0, 0.0, 0.0)
-
-        # 眼睛移动
-        self._set_blend_shape("eyeLookUpLeft", eye_y)
-        self._set_blend_shape("eyeLookUpRight", eye_y)
-        self._set_blend_shape("eyeLookDownLeft", -eye_y)
-        self._set_blend_shape("eyeLookDownRight", -eye_y)
-        self._set_blend_shape("eyeLookInLeft", eye_x)
-        self._set_blend_shape("eyeLookInRight", eye_x)
-        self._set_blend_shape("eyeLookOutLeft", -eye_x)
-        self._set_blend_shape("eyeLookOutRight", -eye_x)
-
-        # 眼睛开合
-        self._set_blend_shape("eyeBlinkLeft", 1.0 - eye_open_l)
-        self._set_blend_shape("eyeBlinkRight", 1.0 - eye_open_r)
-
-        # 嘴巴开合
-        self._set_blend_shape("mouthOpen", mouth_open)
-
+        if self._rig is not None:
+            # Forward every drive signal (including the full-body / hand keys that
+            # arrive via **kwargs) to the rig; VRMRig.set_drive filters to known keys.
+            all_drive = dict(
+                angle_x=angle_x, angle_y=angle_y, angle_z=angle_z,
+                body_angle_x=body_angle_x, body_angle_y=body_angle_y,
+                arm_l=arm_l, arm_r=arm_r, eye_x=eye_x, eye_y=eye_y,
+            )
+            all_drive.update(kwargs)
+            self._rig.set_drive(**all_drive)
+        self._drive = dict(
+            eye_x=eye_x, eye_y=eye_y,
+            eye_open_l=eye_open_l, eye_open_r=eye_open_r,
+            mouth_open=mouth_open,
+        )
+        self._update_morph()
         self.update()
 
     def play_motion(self, group: str = "Tap") -> None:
-        """播放动作（VRM 动画支持待实现）"""
-        # VRM 动画播放需要更复杂的实现
-        pass
+        # 简单挥手/摆头动作
+        if self._rig is None:
+            return
+        self._rig.set_drive(arm_l=0.6, arm_r=-0.4)
+        # 之后恢复由动捕参数决定，这里不强制复位
+        self.update()
 
-    # ---- 内部方法 ----
+    # ---- internal ----
+    def _update_morph(self) -> None:
+        morph: dict[str, float] = {}
+        model = self._model
+        if model is None:
+            self._morph = morph
+            return
+        mouth = max(0.0, min(1.0, self._drive.get("mouth_open", 0.0)))
+        if mouth > 0.01:
+            for preset in _MOUTH_PRESETS:
+                if preset in model.expressions:
+                    morph[preset] = mouth
+                    break
+        blink_l = 1.0 - max(0.0, min(1.0, self._drive.get("eye_open_l", 1.0)))
+        blink_r = 1.0 - max(0.0, min(1.0, self._drive.get("eye_open_r", 1.0)))
+        blink = max(blink_l, blink_r)
+        if blink > 0.01:
+            for preset in _BLINK_PRESETS:
+                if preset in model.expressions:
+                    morph[preset] = blink
+                    break
+        # 无眼骨时用 look 表情驱动眼球
+        if self._rig is not None and not self._rig.has_eye_bones():
+            for preset, value in self._rig.expressions_for_look().items():
+                if preset in model.expressions and abs(value) > 0.01:
+                    morph[preset] = value
+        self._morph = morph
+        if self._renderer is not None:
+            self._renderer.set_morph(morph)
 
     def _detect_params(self) -> None:
-        """检测模型支持的参数"""
         self._params.clear()
+        self._params["head_angle_x"] = ModelParam("head_angle_x", "头部左右旋转", "body", -30.0, 30.0, 0.0)
+        self._params["head_angle_y"] = ModelParam("head_angle_y", "头部上下旋转", "body", -30.0, 30.0, 0.0)
+        self._params["body_angle_x"] = ModelParam("body_angle_x", "身体左右倾斜", "body", -30.0, 30.0, 0.0)
+        self._params["body_angle_y"] = ModelParam("body_angle_y", "身体前后倾斜", "body", -30.0, 30.0, 0.0)
+        self._params["arm_l"] = ModelParam("arm_l", "左臂角度", "arm", -1.0, 1.0, 0.0)
+        self._params["arm_r"] = ModelParam("arm_r", "右臂角度", "arm", -1.0, 1.0, 0.0)
+        self._params["eye_x"] = ModelParam("eye_x", "眼球左右", "eye", -1.0, 1.0, 0.0)
+        self._params["eye_y"] = ModelParam("eye_y", "眼球上下", "eye", -1.0, 1.0, 0.0)
+        self._params["eye_open_l"] = ModelParam("eye_open_l", "左眼开合", "eye", 0.0, 1.0, 1.0)
+        self._params["eye_open_r"] = ModelParam("eye_open_r", "右眼开合", "eye", 0.0, 1.0, 1.0)
+        self._params["mouth_open"] = ModelParam("mouth_open", "嘴巴开合", "mouth", 0.0, 1.0, 0.0)
 
-        if self._model is None:
+    def _setup_renderer(self) -> None:
+        """在 GL 上下文中创建/更新渲染器资源。"""
+        if self._model is None or self._rig is None:
             return
-
-        # 检测骨骼
-        if hasattr(self._model, "humanoid_bones"):
-            bones = self._model.humanoid_bones
-            # 添加身体参数
-            if "head" in bones:
-                self._params["head_angle_x"] = ModelParam(
-                    id="head_angle_x",
-                    name="头部左右旋转",
-                    category="body",
-                    min_value=-30.0,
-                    max_value=30.0,
-                    default_value=0.0,
-                )
-                self._params["head_angle_y"] = ModelParam(
-                    id="head_angle_y",
-                    name="头部上下旋转",
-                    category="body",
-                    min_value=-30.0,
-                    max_value=30.0,
-                    default_value=0.0,
-                )
-            if "spine" in bones or "chest" in bones:
-                self._params["body_angle_x"] = ModelParam(
-                    id="body_angle_x",
-                    name="身体左右倾斜",
-                    category="body",
-                    min_value=-30.0,
-                    max_value=30.0,
-                    default_value=0.0,
-                )
-                self._params["body_angle_y"] = ModelParam(
-                    id="body_angle_y",
-                    name="身体前后倾斜",
-                    category="body",
-                    min_value=-30.0,
-                    max_value=30.0,
-                    default_value=0.0,
-                )
-            if "leftUpperArm" in bones or "rightUpperArm" in bones:
-                self._params["arm_l"] = ModelParam(
-                    id="arm_l",
-                    name="左臂角度",
-                    category="arm",
-                    min_value=-1.0,
-                    max_value=1.0,
-                    default_value=0.0,
-                )
-                self._params["arm_r"] = ModelParam(
-                    id="arm_r",
-                    name="右臂角度",
-                    category="arm",
-                    min_value=-1.0,
-                    max_value=1.0,
-                    default_value=0.0,
-                )
-
-        # 检测表情（BlendShapes）
-        if hasattr(self._model, "blend_shapes"):
-            shapes = self._model.blend_shapes
-            # 添加眼睛参数
-            if any("eye" in s.lower() for s in shapes):
-                self._params["eye_x"] = ModelParam(
-                    id="eye_x",
-                    name="眼球左右",
-                    category="eye",
-                    min_value=-1.0,
-                    max_value=1.0,
-                    default_value=0.0,
-                )
-                self._params["eye_y"] = ModelParam(
-                    id="eye_y",
-                    name="眼球上下",
-                    category="eye",
-                    min_value=-1.0,
-                    max_value=1.0,
-                    default_value=0.0,
-                )
-                self._params["eye_open_l"] = ModelParam(
-                    id="eye_open_l",
-                    name="左眼开合",
-                    category="eye",
-                    min_value=0.0,
-                    max_value=1.0,
-                    default_value=1.0,
-                )
-                self._params["eye_open_r"] = ModelParam(
-                    id="eye_open_r",
-                    name="右眼开合",
-                    category="eye",
-                    min_value=0.0,
-                    max_value=1.0,
-                    default_value=1.0,
-                )
-            # 添加嘴巴参数
-            if any("mouth" in s.lower() for s in shapes):
-                self._params["mouth_open"] = ModelParam(
-                    id="mouth_open",
-                    name="嘴巴开合",
-                    category="mouth",
-                    min_value=0.0,
-                    max_value=1.0,
-                    default_value=0.0,
-                )
-
-    def _set_bone_rotation(self, bone_name: str, x: float, y: float, z: float) -> None:
-        """设置骨骼旋转"""
-        if self._model is None or not hasattr(self._model, "set_bone_rotation"):
-            return
+        self.makeCurrent()
         try:
-            self._model.set_bone_rotation(bone_name, x, y, z)
-        except Exception:
-            pass
+            if self._renderer is not None:
+                self._renderer.release()
+            self._renderer = VRMRenderer()
+            self._renderer.initialize(self._model, self._rig)
+            self._renderer.set_morph(self._morph)
+            self._renderer.resize(max(1, self.width()), max(1, self.height()))
+            self._current_path = self._pending_path
+        except Exception as error:
+            traceback.print_exc()
+            self._renderer = None
+            self._signals.model_error.emit(f"初始化 VRM 渲染器失败: {error}")
+        finally:
+            self.doneCurrent()
 
-    def _set_blend_shape(self, shape_name: str, value: float) -> None:
-        """设置表情混合权重"""
-        if self._model is None or not hasattr(self._model, "set_blend_shape"):
-            return
-        try:
-            self._model.set_blend_shape(shape_name, value)
-        except Exception:
-            pass
-
-    # ---- OpenGL 渲染 ----
-
+    # ---- OpenGL lifecycle ----
     def initializeGL(self) -> None:
-        """初始化 OpenGL"""
         self._gl_ready = True
-        glEnable(GL_DEPTH_TEST)
-        glEnable(GL_LIGHTING)
-        glEnable(GL_LIGHT0)
-        glEnable(GL_COLOR_MATERIAL)
-        glColorMaterial(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE)
-        glClearColor(0.0, 0.0, 0.0, 0.0)
-
-    def paintGL(self) -> None:
-        """渲染场景"""
-        if not self._gl_ready or self._model is None:
-            return
-
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
-        glLoadIdentity()
-
-        # 相机设置
-        gluLookAt(0, 1.5, 3, 0, 1.5, 0, 0, 1, 0)
-
-        # 渲染模型
-        if hasattr(self._model, "render"):
-            self._model.render()
+        if self._model is not None and self._rig is not None:
+            self._setup_renderer()
 
     def resizeGL(self, w: int, h: int) -> None:
-        """窗口大小改变"""
         glViewport(0, 0, w, h)
-        glMatrixMode(GL_PROJECTION)
-        glLoadIdentity()
-        gluPerspective(45, w / h if h > 0 else 1, 0.1, 100.0)
-        glMatrixMode(GL_MODELVIEW)
+        if self._renderer is not None:
+            try:
+                self._renderer.resize(w, h)
+            except Exception:
+                pass
+
+    def paintGL(self) -> None:
+        if self._renderer is not None and self._model is not None:
+            try:
+                if self._rig is not None:
+                    self._rig.update()
+                self._renderer.render()
+                return
+            except Exception:
+                traceback.print_exc()
+                self._renderer = None
+        # 渲染器不可用时的降级背景
+        glClearColor(0.06, 0.08, 0.14, 1.0)
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
 
     # ---- 信号访问 ----
-
     @property
     def model_loaded(self):
         return self._signals.model_loaded

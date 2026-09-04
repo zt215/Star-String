@@ -1,0 +1,11 @@
+package com.graduation.server.controller.dto;
+
+public record CloudPresetResponse(
+        Long id,
+        String owner,
+        String kind,
+        String name,
+        String content,
+        String createdAt
+) {
+}

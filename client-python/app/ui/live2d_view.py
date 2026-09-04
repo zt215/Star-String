@@ -48,6 +48,7 @@ class Live2DView(QOpenGLWidget, ModelViewInterface):
         self._fps = 60
         self._dragging = False
         self._param_ids: set[str] | None = None
+        self._warned_missing: set[str] = set()
         self._signals = ModelViewSignals()
         self._params: dict[str, ModelParam] = {}
 
@@ -157,6 +158,7 @@ class Live2DView(QOpenGLWidget, ModelViewInterface):
     def clear_model(self) -> None:
         self._pending_path = None
         self._current_path = None
+        self._warned_missing.clear()
         if self._model is not None:
             self.makeCurrent()
             try:
@@ -219,6 +221,7 @@ class Live2DView(QOpenGLWidget, ModelViewInterface):
         arm_r: float = 0.0,
         eye_x: float = 0.0,
         eye_y: float = 0.0,
+        **kwargs: Any,
     ) -> None:
         if self._model is None or not hasattr(self._model, "SetParameterValue"):
             return
@@ -253,7 +256,10 @@ class Live2DView(QOpenGLWidget, ModelViewInterface):
             except Exception:
                 self._param_ids = set()
         if self._param_ids is not None and param_id not in self._param_ids:
-            print(f"[Live2D] 参数 {param_id} 不在模型支持的参数列表中，跳过设置")
+            # 每个不支持的参数只提示一次，避免动捕每帧重复打印刷屏
+            if param_id not in self._warned_missing:
+                self._warned_missing.add(param_id)
+                print(f"[Live2D] 参数 {param_id} 不在模型支持的参数列表中，跳过设置")
             return
         try:
             self._model.SetParameterValue(param_id, value)
@@ -344,6 +350,7 @@ class Live2DView(QOpenGLWidget, ModelViewInterface):
                     pass
             self._model = new_model
             self._param_ids = None
+            self._warned_missing.clear()
             self._current_path = str(path)
             self._signals.model_loaded.emit(True)
         finally:

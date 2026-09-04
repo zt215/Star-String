@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
 
 from app.services.account_store import Account, AccountStore
 from app.services.auth_service import LoginError, login as remote_login, register as remote_register
+from app.services.model_store import LOCAL_PROFILE_DISPLAY
 from app.ui.dialogs import show_info, show_warning
 RESOURCES_DIR = Path(__file__).resolve().parent.parent / "resources"
 BACKGROUND_PATH = RESOURCES_DIR / "backgrounds" / "anime_starfield.jpg"
@@ -342,7 +343,7 @@ class StaticBackground(QWidget):
 
 
 class LoginWindow(QMainWindow):
-    login_success = Signal(str)
+    login_success = Signal(str, bool)
 
     def __init__(self) -> None:
         super().__init__()
@@ -460,6 +461,16 @@ class LoginWindow(QMainWindow):
         login_button.setFixedHeight(44)
         login_button.clicked.connect(self._save_current_account)
         card_layout.addWidget(login_button)
+
+        offline_row = QHBoxLayout()
+        offline_row.addStretch()
+        offline_button = QPushButton("离线登录（本地配置）", card)
+        offline_button.setObjectName("linkButton")
+        offline_button.setCursor(Qt.PointingHandCursor)
+        offline_button.clicked.connect(self._offline_login)
+        offline_row.addWidget(offline_button)
+        offline_row.addStretch()
+        card_layout.addLayout(offline_row)
 
         links_row = QHBoxLayout()
         links_row.setSpacing(12)
@@ -770,5 +781,20 @@ class LoginWindow(QMainWindow):
         self._reload_account_combo()
         self.account_combo.setCurrentText(username)
         self.loading_overlay.hide()
-        self.login_success.emit(username)
+        self.login_success.emit(username, False)
+        self.close()
+
+    def _offline_login(self) -> None:
+        """离线登录：不访问服务器，也不读取任何账户内容，只使用独立的本地配置。"""
+        # Always use the dedicated local profile, even if an account name is
+        # already entered in the login form.
+        self.loading_overlay.show()
+        self.loading_overlay.raise_()
+        QTimer.singleShot(400, self._finish_offline_login)
+
+    def _finish_offline_login(self) -> None:
+        # Do not write this local profile into the account list / last_username,
+        # otherwise it could be mistaken for an online account later.
+        self.loading_overlay.hide()
+        self.login_success.emit(LOCAL_PROFILE_DISPLAY, True)
         self.close()

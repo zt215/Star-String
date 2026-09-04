@@ -3,7 +3,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from app.services.model_store import ACCOUNTS_DATA_DIR, _safe_account_name
+from app.services.model_store import (
+    ACCOUNTS_DATA_DIR,
+    LOCAL_PROFILE,
+    LOCAL_PROFILE_DIR,
+    _safe_account_name,
+)
 
 
 DEFAULT_MOTION_SETTINGS = {
@@ -29,11 +34,18 @@ DEFAULT_MOTION_SETTINGS = {
 
 
 class SettingsStore:
-    """Per-account application settings persisted under accounts_data/<account>/."""
+    """Per-account application settings persisted under accounts_data/<account>/.
+
+    If ``account`` is :data:`LOCAL_PROFILE`, the store is the separate offline/local
+    profile and never touches any account data.
+    """
 
     def __init__(self, account: str | None = None) -> None:
-        base = ACCOUNTS_DATA_DIR / _safe_account_name(account or "default")
-        self.path = base / "settings.json"
+        if account == LOCAL_PROFILE:
+            self.path = LOCAL_PROFILE_DIR / "settings.json"
+        else:
+            base = ACCOUNTS_DATA_DIR / _safe_account_name(account or "default")
+            self.path = base / "settings.json"
 
     def load_motion(self) -> dict:
         settings = self._load_all()

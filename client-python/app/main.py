@@ -9,6 +9,7 @@ from PySide6.QtWidgets import QApplication
 
 from app.services.account_store import AccountStore
 from app.services.auth_service import LoginError, login as remote_login
+from app.services.model_store import LOCAL_PROFILE_DISPLAY
 from app.ui.home_window import HomeWindow
 from app.ui.loading_window import LoadingWindow
 from app.ui.login_window import LoginWindow
@@ -40,8 +41,12 @@ def main() -> int:
 
     current = {"window": None}
 
-    def open_home(username: str | None = None) -> None:
-        home = HomeWindow(username)
+    def open_home(username: str | None = None, offline: bool = False) -> None:
+        if offline:
+            # Offline mode always uses the separate local profile, never the
+            # account that happens to be selected in the login form.
+            username = LOCAL_PROFILE_DISPLAY
+        home = HomeWindow(username, offline)
         home.logout_requested.connect(show_login)
         home.show()
         if current["window"] is not None:
@@ -75,6 +80,10 @@ def main() -> int:
         loading.show()
 
         def finish_auto_login() -> None:
+            if account.offline:
+                loading.close()
+                open_home(None, True)
+                return
             try:
                 remote_login(account.username, account.password)
             except LoginError:
@@ -82,7 +91,7 @@ def main() -> int:
                 show_login()
                 return
             loading.close()
-            open_home(account.username)
+            open_home(account.username, False)
 
         QTimer.singleShot(1200, finish_auto_login)
 
