@@ -32,6 +32,19 @@ DEFAULT_MOTION_SETTINGS = {
     },
 }
 
+DEFAULT_RVC_SETTINGS = {
+    "pitch_shift": 0,
+    "f0_method": "rmvpe",
+    "index_rate": 75,
+    "filter_radius": 3,
+    "rms_mix_rate": 25,
+    "resample_sr": "0",
+    "protect_voiceless": True,
+    "is_half": True,
+    "input_device_name": "",
+    "output_device_name": "",
+}
+
 
 class SettingsStore:
     """Per-account application settings persisted under accounts_data/<account>/.
@@ -54,6 +67,19 @@ class SettingsStore:
     def save_motion(self, motion: dict) -> None:
         settings = self._load_all()
         settings["motion"] = dict(DEFAULT_MOTION_SETTINGS, **motion)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(
+            json.dumps(settings, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def load_rvc(self) -> dict:
+        settings = self._load_all()
+        return dict(DEFAULT_RVC_SETTINGS, **settings.get("rvc", {}))
+
+    def save_rvc(self, rvc: dict) -> None:
+        settings = self._load_all()
+        settings["rvc"] = dict(DEFAULT_RVC_SETTINGS, **rvc)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(
             json.dumps(settings, ensure_ascii=False, indent=2),

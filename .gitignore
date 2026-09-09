@@ -32,6 +32,7 @@ tools/
 
 # Python 虚拟环境
 .venv/
+.venv-rvc/
 venv/
 __pycache__/
 *.pyc

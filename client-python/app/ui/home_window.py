@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 import threading
+import numpy as np
 from pathlib import Path
 
 from PySide6.QtCore import QEasingCurve, QPointF, QPropertyAnimation, QRect, Qt, Signal
@@ -22,13 +24,16 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QProgressBar,
     QScrollArea,
+    QSlider,
     QSpinBox,
     QSizePolicy,
     QStackedWidget,
     QStyle,
     QStyleOptionComboBox,
     QStyleOptionSpinBox,
+    QTabBar,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -50,6 +55,7 @@ from app.services.model_store import (
     LOCAL_PROFILE_DISPLAY,
     ModelStore,
 )
+from app.services.rvc_service import RVCEngine, _gram_sample_length
 from app.services.motion_capture import MotionCapture
 from app.services.settings_store import SettingsStore
 from app.ui.dialogs import show_info, show_warning
@@ -189,6 +195,35 @@ QTabWidget#modelTabs QTabBar::tab:hover {
     color: #EAF6FF;
 }
 
+QTabBar#avatarTypeTabs::tab {
+    background: #111B33;
+    color: #9DB5D8;
+    padding: 7px 22px;
+    border: 1px solid #284064;
+    border-right: none;
+}
+
+QTabBar#avatarTypeTabs::tab:first {
+    border-top-left-radius: 8px;
+    border-bottom-left-radius: 8px;
+}
+
+QTabBar#avatarTypeTabs::tab:last {
+    border-top-right-radius: 8px;
+    border-bottom-right-radius: 8px;
+    border-right: 1px solid #284064;
+}
+
+QTabBar#avatarTypeTabs::tab:selected {
+    color: #7EE7FF;
+    background-color: rgba(62, 145, 230, 26);
+    border-color: #4AA9E8;
+}
+
+QTabBar#avatarTypeTabs::tab:hover {
+    color: #EAF6FF;
+}
+
 QPushButton#actionButton {
     background-color: #1E6FD9;
     color: #FFFFFF;
@@ -206,6 +241,18 @@ QPushButton#actionButton:hover {
 
 QPushButton#actionButton:pressed {
     background-color: #1A60C2;
+}
+
+QProgressBar#volumeBar {
+    background-color: #0A142A;
+    border: 1px solid #284064;
+    border-radius: 4px;
+    text-align: center;
+}
+
+QProgressBar#volumeBar::chunk {
+    background-color: #4AA9E8;
+    border-radius: 3px;
 }
 
 QFrame#stagePanel {
@@ -353,6 +400,48 @@ QPushButton#ghostButton:hover {
     color: #EAF6FF;
     border-color: #4AA9E8;
 }
+
+QPushButton#smallGhostButton {
+    background: transparent;
+    border: 1px solid #284064;
+    border-radius: 6px;
+    color: #9DB5D8;
+    padding: 3px 10px;
+    min-width: 0;
+}
+
+QPushButton#smallGhostButton:hover {
+    color: #EAF6FF;
+    border-color: #4AA9E8;
+}
+
+QSlider#rvcSlider {
+    min-height: 20px;
+}
+
+QSlider#rvcSlider::groove:horizontal {
+    height: 6px;
+    background: #1A2A4A;
+    border-radius: 3px;
+}
+
+QSlider#rvcSlider::handle:horizontal {
+    background: #4AA9E8;
+    border: none;
+    width: 14px;
+    height: 14px;
+    margin: -4px 0;
+    border-radius: 7px;
+}
+
+QSlider#rvcSlider::handle:horizontal:hover {
+    background: #6BB8F0;
+}
+
+QSlider#rvcSlider::sub-page:horizontal {
+    background: #4AA9E8;
+    border-radius: 3px;
+}
 """
 
 
@@ -487,6 +576,8 @@ class HomeWindow(QMainWindow):
     cloud_action_error = Signal(str)
     cloud_presets_loaded = Signal(list)
     cloud_presets_error = Signal(str)
+    rvc_status_changed = Signal(str, bool)
+    rvc_volume_updated = Signal(int, int)
 
     def __init__(self, account: str | None = None, offline: bool = False) -> None:
         super().__init__()
@@ -513,6 +604,7 @@ class HomeWindow(QMainWindow):
         self.personal_page_index = 0
         self._avatar_running = False  # 模型预览是否处于启动（显示）状态
         self._avatar_running_before_capture = False  # 动捕开始前模型是否已启动
+        self._avatar_kind = "live2d"  # 虚拟形象页当前模型类型（live2d / vrm）
 
         icon_path = ICON_PATH if ICON_PATH.exists() else LOGO_PATH
         self.setWindowIcon(QIcon(str(icon_path)))
@@ -528,8 +620,11 @@ class HomeWindow(QMainWindow):
         self.cloud_action_error.connect(self._on_cloud_action_error)
         self.cloud_presets_loaded.connect(self._on_cloud_presets_loaded)
         self.cloud_presets_error.connect(self._on_cloud_presets_error)
+        self.rvc_status_changed.connect(self._on_rvc_status_changed)
+        self.rvc_volume_updated.connect(self._on_rvc_volume_updated)
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        self._save_rvc_settings()
         self._shutdown_live2d()
         self.motion_capture.shutdown()
         super().closeEvent(event)
@@ -663,6 +758,8 @@ class HomeWindow(QMainWindow):
         self.nav_group.setExclusive(True)
         self._place_live2d_for_page(index)
         self._sync_preview_views()
+        if index == 2:  # RVC页面
+            self._refresh_audio_devices()
         if index == 7:
             self._refresh_cloud_models()
             self._refresh_cloud_presets()
@@ -739,9 +836,7 @@ class HomeWindow(QMainWindow):
                 if avatar_vrm is not None:
                     avatar_vrm.hide()
                 return
-            model_type = "live2d"
-            if hasattr(self, "avatar_model_type_combo"):
-                model_type = self.avatar_model_type_combo.currentText().lower()
+            model_type = self._current_avatar_kind()
             if model_type == "vrm" and avatar_vrm is not None:
                 avatar_vrm.show()
                 shared.hide()
@@ -762,9 +857,7 @@ class HomeWindow(QMainWindow):
                 if shared is not None:
                     shared.hide()
                 return
-            model_type = "live2d"
-            if hasattr(self, "avatar_model_type_combo"):
-                model_type = self.avatar_model_type_combo.currentText().lower()
+            model_type = self._current_avatar_kind()
             if model_type == "vrm":
                 avatar_vrm.show()
                 if shared is not None:
@@ -853,11 +946,12 @@ class HomeWindow(QMainWindow):
         self.motion_start_button = QPushButton("开始动捕")
         self.motion_start_button.setObjectName("actionButton")
         self.motion_start_button.clicked.connect(self._on_motion_start)
-        stop_button = QPushButton("停止")
-        stop_button.setObjectName("ghostButton")
-        stop_button.clicked.connect(self._on_motion_stop)
+        self.motion_stop_button = QPushButton("停止")
+        self.motion_stop_button.setObjectName("ghostButton")
+        self.motion_stop_button.clicked.connect(self._on_motion_stop)
+        self.motion_stop_button.hide()  # 未开始动捕只显示“开始动捕”
         start_stop.addWidget(self.motion_start_button)
-        start_stop.addWidget(stop_button)
+        start_stop.addWidget(self.motion_stop_button)
         start_stop.addStretch()
         controls_box.addLayout(start_stop)
         controls_box.addStretch()
@@ -1076,11 +1170,12 @@ class HomeWindow(QMainWindow):
         self._apply_motion_settings()
         self._avatar_running_before_capture = getattr(self, "_avatar_running", False)
         if self.motion_capture.start():
-            self.motion_start_button.setEnabled(False)
+            self.motion_start_button.hide()
+            self.motion_stop_button.show()
             self.motion_status.setText("动捕运行中")
             # 动捕期间让头像保持显示并可被驱动；若此前未启动，结束后回退
             self._avatar_running = True
-            model_type = self.avatar_model_type_combo.currentText().lower() if hasattr(self, "avatar_model_type_combo") else "live2d"
+            model_type = self._current_avatar_kind()
             if model_type in ("live2d", "vrm"):
                 self._refresh_model_list(model_type)
             self._sync_preview_views()
@@ -1090,7 +1185,8 @@ class HomeWindow(QMainWindow):
 
     def _on_motion_stop(self) -> None:
         self.motion_capture.stop()
-        self.motion_start_button.setEnabled(True)
+        self.motion_start_button.show()
+        self.motion_stop_button.hide()
         self.motion_status.setText("动捕已停止")
         # 若动捕前模型未启动，则停止后回退到未启动状态
         if not getattr(self, "_avatar_running_before_capture", False):
@@ -1122,7 +1218,7 @@ class HomeWindow(QMainWindow):
 
     def _on_motion_drive(self, drive: dict) -> None:
         # 根据当前模型类型传递动捕数据
-        model_type = self.avatar_model_type_combo.currentText().lower() if hasattr(self, "avatar_model_type_combo") else "live2d"
+        model_type = self._current_avatar_kind()
         
         if model_type == "live2d":
             if getattr(self, "live2d_view", None) is not None:
@@ -1325,33 +1421,34 @@ class HomeWindow(QMainWindow):
         # 模型类型切换器
         model_type_layout = QHBoxLayout()
         model_type_layout.setSpacing(8)
-        self.avatar_model_type_combo = QComboBox()
-        self.avatar_model_type_combo.setObjectName("navButton")
-        self.avatar_model_type_combo.addItems(["Live2D", "VRM"])
-        self.avatar_model_type_combo.currentTextChanged.connect(self._on_avatar_model_type_changed)
+        self.avatar_type_tabs = QTabBar()
+        self.avatar_type_tabs.setObjectName("avatarTypeTabs")
+        self.avatar_type_tabs.addTab("Live2D")
+        self.avatar_type_tabs.addTab("VRM")
+        self.avatar_type_tabs.currentChanged.connect(self._on_avatar_model_type_changed)
         model_type_layout.addWidget(QLabel("模型类型："))
-        model_type_layout.addWidget(self.avatar_model_type_combo)
+        model_type_layout.addWidget(self.avatar_type_tabs, 1)
         model_type_layout.addStretch()
         picker_layout.addLayout(model_type_layout)
 
-        self.avatar_model_list = QListWidget()
-        self.avatar_model_list.setObjectName("modelList")
-        self.avatar_model_list.setSelectionMode(QAbstractItemView.SingleSelection)
-        picker_layout.addWidget(self.avatar_model_list, 1)
+        self.avatar_model_combo = QComboBox()
+        self.avatar_model_combo.setObjectName("inputBox")
+        picker_layout.addWidget(self.avatar_model_combo)
 
         buttons = QHBoxLayout()
         buttons.setSpacing(8)
-        start_button = QPushButton("启动")
-        start_button.setObjectName("actionButton")
-        start_button.clicked.connect(lambda _=False: self._start_avatar())
-        stop_button = QPushButton("停止")
-        stop_button.setObjectName("actionButton")
-        stop_button.clicked.connect(lambda _=False: self._stop_avatar())
+        self.avatar_start_button = QPushButton("启动")
+        self.avatar_start_button.setObjectName("actionButton")
+        self.avatar_start_button.clicked.connect(lambda _=False: self._start_avatar())
+        self.avatar_stop_button = QPushButton("停止")
+        self.avatar_stop_button.setObjectName("actionButton")
+        self.avatar_stop_button.clicked.connect(lambda _=False: self._stop_avatar())
+        self.avatar_stop_button.hide()  # 未启动时只显示“启动”
         reload_button = QPushButton("重新加载")
         reload_button.setObjectName("actionButton")
         reload_button.clicked.connect(lambda _=False: self._reload_live2d())
-        buttons.addWidget(start_button)
-        buttons.addWidget(stop_button)
+        buttons.addWidget(self.avatar_start_button)
+        buttons.addWidget(self.avatar_stop_button)
         buttons.addWidget(reload_button)
         buttons.addStretch()
         picker_layout.addLayout(buttons)
@@ -1465,19 +1562,17 @@ class HomeWindow(QMainWindow):
                 label.setText(text)
 
     def _refresh_avatar_model_list(self) -> None:
-        """按当前模型类型刷新虚拟形象页列表；仅模型已启动时标记[使用中]。"""
-        if getattr(self, "avatar_model_list", None) is None:
+        """按当前模型类型刷新虚拟形象页模型下拉；仅模型已启动时标记[使用中]。"""
+        if getattr(self, "avatar_model_combo", None) is None:
             return
-        self.avatar_model_list.clear()
-        model_type = "live2d"
-        if hasattr(self, "avatar_model_type_combo"):
-            model_type = self.avatar_model_type_combo.currentText().lower()
+        self.avatar_model_combo.clear()
+        model_type = self._current_avatar_kind()
         running = getattr(self, "_avatar_running", False)
         for entry in self.model_entries:
             if entry.kind != model_type:
                 continue
             suffix = " [使用中]" if (entry.active and running) else ""
-            self.avatar_model_list.addItem(f"{entry.name}{suffix}")
+            self.avatar_model_combo.addItem(f"{entry.name}{suffix}", entry.name)
 
     def _refresh_live2d_page(self) -> None:
         self._refresh_avatar_model_list()
@@ -1485,11 +1580,11 @@ class HomeWindow(QMainWindow):
 
     def _start_avatar(self) -> None:
         """启动并显示当前选中的模型，预览不再自动加载，需手动启动。"""
-        if self.avatar_model_list.currentItem() is None:
-            show_info(self, "星弦", "请先选择一个模型")
+        model_type = self._current_avatar_kind()
+        if self.avatar_model_combo.currentIndex() < 0 or self.avatar_model_combo.currentData() is None:
+            show_info(self, "星弦", "暂无该类型模型，请先在模型管理中导入并启用")
             return
-        name = self.avatar_model_list.currentItem().text().split(" [")[0]
-        model_type = self.avatar_model_type_combo.currentText().lower()
+        name = self.avatar_model_combo.currentData()
         self._avatar_running = True
 
         if model_type == "live2d":
@@ -1501,6 +1596,10 @@ class HomeWindow(QMainWindow):
 
         self._sync_preview_views()
         self.avatar_status.setText(f"已启动：{name}")
+        if hasattr(self, "avatar_start_button"):
+            self.avatar_start_button.hide()
+        if hasattr(self, "avatar_stop_button"):
+            self.avatar_stop_button.show()
 
     def _stop_avatar(self) -> None:
         """停止模型预览，清除视图并隐藏，不再一直显示。"""
@@ -1522,6 +1621,10 @@ class HomeWindow(QMainWindow):
             label = getattr(self, attr, None)
             if label is not None:
                 label.setText("已停止")
+        if hasattr(self, "avatar_start_button"):
+            self.avatar_start_button.show()
+        if hasattr(self, "avatar_stop_button"):
+            self.avatar_stop_button.hide()
 
     def _reload_live2d(self) -> None:
         if not getattr(self, "_avatar_running", False):
@@ -1534,12 +1637,14 @@ class HomeWindow(QMainWindow):
         self._sync_live2d_views()
         self.avatar_status.setText(f"正在重新加载：{active.name}")
 
-    def _on_avatar_model_type_changed(self, model_type: str) -> None:
-        """模型类型切换回调"""
-        if model_type == "Live2D":
-            self._refresh_model_list("live2d")
-        elif model_type == "VRM":
-            self._refresh_model_list("vrm")
+    def _current_avatar_kind(self) -> str:
+        """返回虚拟形象页当前选中的模型类型（live2d / vrm）。"""
+        return self._avatar_kind
+
+    def _on_avatar_model_type_changed(self, index: int) -> None:
+        """左右标签页切换模型类型回调"""
+        self._avatar_kind = "live2d" if index <= 0 else "vrm"
+        self._refresh_avatar_model_list()
         self._sync_preview_views()
         self._refresh_drive_params_card()
 
@@ -1601,9 +1706,8 @@ class HomeWindow(QMainWindow):
         self.drive_params_status.setWordWrap(True)
         refresh_row.addWidget(self.drive_params_status, 1)
         refresh_button = QPushButton("刷新")
-        refresh_button.setObjectName("ghostButton")
-        refresh_button.setFixedWidth(64)
-        refresh_button.setFixedHeight(28)
+        refresh_button.setObjectName("smallGhostButton")
+        refresh_button.setFixedSize(56, 26)
         refresh_button.clicked.connect(self._on_drive_params_refresh)
         refresh_row.addWidget(refresh_button)
         box.addLayout(refresh_row)
@@ -1622,14 +1726,31 @@ class HomeWindow(QMainWindow):
                 name = QLabel(label)
                 name.setObjectName("hintText")
                 grid.addWidget(name, row, 0)
-                spin = QDoubleSpinBox()
-                spin.setObjectName("paramSpin")
-                spin.setRange(0.0, 3.0)
-                spin.setSingleStep(0.1)
-                spin.setValue(float(params.get(key, {}).get("mult", 1.0)))
-                spin.valueChanged.connect(lambda value, k=key: self._on_drive_param_mult(k, value))
-                grid.addWidget(spin, row, 1)
-                self.drive_param_spins[key] = spin
+                mult = float(params.get(key, {}).get("mult", 1.0))
+                amp = QWidget()
+                amp_layout = QHBoxLayout(amp)
+                amp_layout.setContentsMargins(0, 0, 0, 0)
+                amp_layout.setSpacing(4)
+                slider = QSlider(Qt.Orientation.Horizontal)
+                slider.setObjectName("rvcSlider")
+                slider.setRange(0, 30)  # 0.0 ~ 3.0，步进 0.1
+                slider.setSingleStep(1)
+                slider.setPageStep(5)
+                slider.setValue(int(round(mult * 10.0)))
+                value_label = QLabel(f"{mult:.2f}")
+                value_label.setObjectName("infoValue")
+                value_label.setFixedWidth(40)
+                value_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+
+                def _on_slider(value: int, k: str = key, lbl: QLabel = value_label) -> None:
+                    lbl.setText(f"{value / 10.0:.2f}")
+                    self._on_drive_param_mult(k, value / 10.0)
+
+                slider.valueChanged.connect(_on_slider)
+                amp_layout.addWidget(slider, 1)
+                amp_layout.addWidget(value_label)
+                grid.addWidget(amp, row, 1)
+                self.drive_param_spins[key] = slider
                 if has_invert:
                     invert = QCheckBox()
                     invert.setObjectName("toggle")
@@ -1661,7 +1782,7 @@ class HomeWindow(QMainWindow):
 
     def _supported_params_for_current(self) -> list:
         """按当前模型类型，从实际加载的模型视图中读取其支持的参数。"""
-        model_type = self.avatar_model_type_combo.currentText().lower() if hasattr(self, "avatar_model_type_combo") else "live2d"
+        model_type = self._current_avatar_kind()
         if model_type == "live2d":
             view = getattr(self, "live2d_view", None)
         elif model_type == "vrm":
@@ -1714,6 +1835,57 @@ class HomeWindow(QMainWindow):
         label = QLabel(text)
         label.setObjectName("hintText")
         return label
+
+    @staticmethod
+    def _make_rvc_slider(
+        label_text: str,
+        min_val: int,
+        max_val: int,
+        default: int,
+        *,
+        is_int: bool = True,
+        display_fmt=None,
+    ) -> QWidget:
+        """创建一个 RVC 风格的滑条控件：标签 | 滑条 | 数值显示。"""
+        widget = QWidget()
+        h = QHBoxLayout(widget)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(8)
+
+        label = QLabel(label_text)
+        label.setFixedWidth(100)
+        h.addWidget(label)
+
+        slider = QSlider(Qt.Horizontal)
+        slider.setRange(min_val, max_val)
+        slider.setValue(default)
+        slider.setObjectName("rvcSlider")
+        h.addWidget(slider, 1)
+
+        value_label = QLabel()
+        value_label.setFixedWidth(50)
+        value_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        h.addWidget(value_label)
+
+        # 存储格式化函数
+        if display_fmt is None:
+            if is_int:
+                display_fmt = lambda v: str(v)
+            else:
+                display_fmt = lambda v: f"{v:.2f}"
+
+        def on_value_changed(val):
+            value_label.setText(display_fmt(val))
+
+        slider.valueChanged.connect(on_value_changed)
+        on_value_changed(default)
+
+        # 在 widget 上挂载 slider 引用，方便后续读取
+        widget.slider = slider  # type: ignore[attr-defined]
+        widget._display_fmt = display_fmt  # type: ignore[attr-defined]
+        widget.value = lambda: slider.value()  # type: ignore[attr-defined]
+
+        return widget
 
     def _build_personal_center_page(self) -> QWidget:
         page = QWidget()
@@ -2052,7 +2224,278 @@ class HomeWindow(QMainWindow):
         return page
 
     def _build_rvc_page(self) -> QWidget:
-        return self._build_model_page("rvc", "音频变声")
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(28, 24, 28, 24)
+        layout.setSpacing(14)
+
+        title_label = QLabel("音频变声")
+        title_label.setObjectName("pageTitle")
+        layout.addWidget(title_label)
+
+        # 主内容区域：左右布局
+        content = QHBoxLayout()
+        content.setSpacing(14)
+
+        # 左侧：模型选择和参数设置
+        left_panel = QFrame()
+        left_panel.setObjectName("panel")
+        left_panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(16, 14, 16, 14)
+        left_layout.setSpacing(12)
+
+        # 模型选择区域
+        model_title = QLabel("RVC 模型选择")
+        model_title.setObjectName("panelTitle")
+        left_layout.addWidget(model_title)
+
+        self.rvc_model_combo = QComboBox()
+        self.rvc_model_combo.setObjectName("inputBox")
+        left_layout.addWidget(self.rvc_model_combo)
+
+        # 参数设置区域
+        params_title = QLabel("变声参数设置")
+        params_title.setObjectName("panelTitle")
+        left_layout.addWidget(params_title)
+
+        params_form = QGridLayout()
+        params_form.setSpacing(8)
+
+        # 音调变换 (整数滑条: -24 ~ 24)
+        self.rvc_pitch_shift = self._make_rvc_slider(
+            "音调变换 (半音)", -24, 24, 0, is_int=True
+        )
+        params_form.addWidget(self.rvc_pitch_shift, 0, 0, 1, 2)
+
+        # 索引比例 (滑条: 0 ~ 100, 显示 0.00 ~ 1.00)
+        self.rvc_index_rate = self._make_rvc_slider(
+            "索引比例", 0, 100, 75, is_int=True, display_fmt=lambda v: f"{v / 100:.2f}"
+        )
+        params_form.addWidget(self.rvc_index_rate, 1, 0, 1, 2)
+
+        # 滤波半径 (整数滑条: 0 ~ 7)
+        self.rvc_filter_radius = self._make_rvc_slider(
+            "滤波半径", 0, 7, 3, is_int=True
+        )
+        params_form.addWidget(self.rvc_filter_radius, 2, 0, 1, 2)
+
+        # RMS混合比例 (滑条: 0 ~ 100, 显示 0.00 ~ 1.00)
+        self.rvc_rms_mix_rate = self._make_rvc_slider(
+            "RMS混合比例", 0, 100, 25, is_int=True, display_fmt=lambda v: f"{v / 100:.2f}"
+        )
+        params_form.addWidget(self.rvc_rms_mix_rate, 3, 0, 1, 2)
+
+        left_layout.addLayout(params_form)
+
+        # 音高提取方法 (单选按钮组)
+        f0_title = QLabel("音高提取算法")
+        f0_title.setObjectName("panelBody")
+        left_layout.addWidget(f0_title)
+
+        f0_group = QButtonGroup(self)
+        f0_layout = QHBoxLayout()
+        f0_layout.setSpacing(6)
+        self.rvc_f0_buttons: dict[str, QCheckBox] = {}
+        for method in ["rmvpe", "crepe", "harvest", "fcpe"]:
+            btn = QCheckBox(method)
+            btn.setObjectName("toggle")
+            f0_group.addButton(btn)
+            f0_layout.addWidget(btn)
+            self.rvc_f0_buttons[method] = btn
+            if method == "harvest":
+                btn.setChecked(True)
+        f0_layout.addStretch()
+        left_layout.addLayout(f0_layout)
+
+        # ComboBox 设置区域
+        combo_form = QGridLayout()
+        combo_form.setSpacing(8)
+
+        # 音高提取方法（下拉框）
+        combo_form.addWidget(self._form_label("音高提取方法"), 0, 0)
+        self.rvc_f0_method = ArrowComboBox()
+        self.rvc_f0_method.setObjectName("inputBox")
+        self.rvc_f0_method.addItems(["rmvpe", "crepe", "harvest", "mangio-crepe"])
+        self.rvc_f0_method.setCurrentText("rmvpe")
+        combo_form.addWidget(self.rvc_f0_method, 0, 1)
+
+        # 重采样率
+        combo_form.addWidget(self._form_label("重采样率"), 1, 0)
+        self.rvc_resample_sr = ArrowComboBox()
+        self.rvc_resample_sr.setObjectName("inputBox")
+        self.rvc_resample_sr.addItems(["0", "40000", "48000"])
+        self.rvc_resample_sr.setCurrentText("0")
+        combo_form.addWidget(self.rvc_resample_sr, 1, 1)
+
+        left_layout.addLayout(combo_form)
+
+        # 复选框设置
+        check_layout = QHBoxLayout()
+        check_layout.setSpacing(12)
+        self.rvc_protect_voiceless = QCheckBox("保护无音节")
+        self.rvc_protect_voiceless.setObjectName("toggle")
+        self.rvc_protect_voiceless.setChecked(True)
+        check_layout.addWidget(self.rvc_protect_voiceless)
+
+        self.rvc_is_half = QCheckBox("半精度(FP16)")
+        self.rvc_is_half.setObjectName("toggle")
+        self.rvc_is_half.setChecked(True)
+        check_layout.addWidget(self.rvc_is_half)
+        check_layout.addStretch()
+        left_layout.addLayout(check_layout)
+        left_layout.addStretch()
+
+        # 右侧：设备选择和控制
+        right_panel = QFrame()
+        right_panel.setObjectName("panel")
+        right_panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(16, 14, 16, 14)
+        right_layout.setSpacing(12)
+
+        # 设备选择区域
+        device_title = QLabel("音频设备选择")
+        device_title.setObjectName("panelTitle")
+        right_layout.addWidget(device_title)
+
+        # 输入设备
+        input_device_layout = QHBoxLayout()
+        input_device_layout.setSpacing(8)
+        input_device_layout.addWidget(self._form_label("输入设备："))
+        self.rvc_input_device = ArrowComboBox()
+        self.rvc_input_device.setObjectName("inputBox")
+        self.rvc_input_device.setMinimumWidth(200)
+        input_device_layout.addWidget(self.rvc_input_device, 1)
+        right_layout.addLayout(input_device_layout)
+
+        # 输出设备
+        output_device_layout = QHBoxLayout()
+        output_device_layout.setSpacing(8)
+        output_device_layout.addWidget(self._form_label("输出设备："))
+        self.rvc_output_device = ArrowComboBox()
+        self.rvc_output_device.setObjectName("inputBox")
+        self.rvc_output_device.setMinimumWidth(200)
+        output_device_layout.addWidget(self.rvc_output_device, 1)
+        right_layout.addLayout(output_device_layout)
+
+        # 刷新设备按钮
+        refresh_devices_button = QPushButton("刷新设备列表")
+        refresh_devices_button.setObjectName("ghostButton")
+        refresh_devices_button.clicked.connect(self._refresh_audio_devices)
+        right_layout.addWidget(refresh_devices_button)
+
+        setup_virtual_button = QPushButton("一键启用虚拟声卡")
+        setup_virtual_button.setObjectName("actionButton")
+        setup_virtual_button.clicked.connect(self._setup_virtual_audio)
+        right_layout.addWidget(setup_virtual_button)
+
+        self.rvc_audio_hint = QLabel("")
+        self.rvc_audio_hint.setObjectName("hintText")
+        self.rvc_audio_hint.setWordWrap(True)
+        right_layout.addWidget(self.rvc_audio_hint)
+
+        right_layout.addSpacing(20)
+
+        # 变声控制区域
+        control_title = QLabel("变声控制")
+        control_title.setObjectName("panelTitle")
+        right_layout.addWidget(control_title)
+
+        # 状态显示
+        self.rvc_status = QLabel("状态：未启动")
+        self.rvc_status.setObjectName("infoValue")
+        right_layout.addWidget(self.rvc_status)
+
+        # 当前模型显示
+        self.rvc_current_model = QLabel("当前模型：未选择")
+        self.rvc_current_model.setObjectName("panelBody")
+        right_layout.addWidget(self.rvc_current_model)
+
+        right_layout.addSpacing(20)
+
+        # 音量监控区域
+        volume_title = QLabel("音量监控")
+        volume_title.setObjectName("panelTitle")
+        right_layout.addWidget(volume_title)
+
+        # 输入音量
+        input_volume_layout = QHBoxLayout()
+        input_volume_layout.setSpacing(8)
+        input_volume_layout.addWidget(self._form_label("输入音量："))
+        self.rvc_input_volume_bar = QProgressBar()
+        self.rvc_input_volume_bar.setObjectName("volumeBar")
+        self.rvc_input_volume_bar.setRange(0, 100)
+        self.rvc_input_volume_bar.setValue(0)
+        self.rvc_input_volume_bar.setTextVisible(False)
+        self.rvc_input_volume_bar.setFixedHeight(20)
+        input_volume_layout.addWidget(self.rvc_input_volume_bar, 1)
+        self.rvc_input_volume_label = QLabel("0%")
+        self.rvc_input_volume_label.setObjectName("infoValue")
+        self.rvc_input_volume_label.setFixedWidth(40)
+        input_volume_layout.addWidget(self.rvc_input_volume_label)
+        right_layout.addLayout(input_volume_layout)
+
+        # 输出音量
+        output_volume_layout = QHBoxLayout()
+        output_volume_layout.setSpacing(8)
+        output_volume_layout.addWidget(self._form_label("输出音量："))
+        self.rvc_output_volume_bar = QProgressBar()
+        self.rvc_output_volume_bar.setObjectName("volumeBar")
+        self.rvc_output_volume_bar.setRange(0, 100)
+        self.rvc_output_volume_bar.setValue(0)
+        self.rvc_output_volume_bar.setTextVisible(False)
+        self.rvc_output_volume_bar.setFixedHeight(20)
+        output_volume_layout.addWidget(self.rvc_output_volume_bar, 1)
+        self.rvc_output_volume_label = QLabel("0%")
+        self.rvc_output_volume_label.setObjectName("infoValue")
+        self.rvc_output_volume_label.setFixedWidth(40)
+        output_volume_layout.addWidget(self.rvc_output_volume_label)
+        right_layout.addLayout(output_volume_layout)
+
+        right_layout.addSpacing(20)
+
+        # 开始/停止按钮
+        control_buttons = QHBoxLayout()
+        control_buttons.setSpacing(12)
+        self.rvc_start_button = QPushButton("开始变声")
+        self.rvc_start_button.setObjectName("actionButton")
+        self.rvc_start_button.clicked.connect(self._on_rvc_start)
+        self.rvc_stop_button = QPushButton("停止变声")
+        self.rvc_stop_button.setObjectName("ghostButton")
+        self.rvc_stop_button.clicked.connect(self._on_rvc_stop)
+        self.rvc_stop_button.hide()  # 未开始变声只显示“开始变声”
+        control_buttons.addWidget(self.rvc_start_button)
+        control_buttons.addWidget(self.rvc_stop_button)
+        control_buttons.addStretch()
+        right_layout.addLayout(control_buttons)
+
+        right_layout.addStretch()
+
+        content.addWidget(left_panel, 1)
+        content.addWidget(right_panel, 1)
+        layout.addLayout(content, 1)
+
+        # 初始化
+        self._refresh_rvc_model_list()
+        self._rvc_running = False
+
+        # 加载上次保存的 RVC 设置
+        self._load_rvc_settings()
+
+        # 参数变化时自动保存
+        self.rvc_pitch_shift.slider.valueChanged.connect(lambda _: self._save_rvc_settings())
+        self.rvc_index_rate.slider.valueChanged.connect(lambda _: self._save_rvc_settings())
+        self.rvc_filter_radius.slider.valueChanged.connect(lambda _: self._save_rvc_settings())
+        self.rvc_rms_mix_rate.slider.valueChanged.connect(lambda _: self._save_rvc_settings())
+        self.rvc_f0_method.currentIndexChanged.connect(lambda _: self._save_rvc_settings())
+        self.rvc_resample_sr.currentIndexChanged.connect(lambda _: self._save_rvc_settings())
+        self.rvc_protect_voiceless.stateChanged.connect(lambda _: self._save_rvc_settings())
+        self.rvc_is_half.stateChanged.connect(lambda _: self._save_rvc_settings())
+        self.rvc_input_device.currentIndexChanged.connect(lambda _: self._save_rvc_settings())
+        self.rvc_output_device.currentIndexChanged.connect(lambda _: self._save_rvc_settings())
+
+        return page
 
     def _build_model_page(self, kind: str, title: str) -> QWidget:
         page = QWidget()
@@ -2685,3 +3128,516 @@ class HomeWindow(QMainWindow):
         name = model_list.currentItem().text().split(" [")[0]
         self.model_entries = self.model_store.remove(name)
         self._refresh_model_list(kind)
+
+    # ---- RVC 变声功能 ----
+
+    def _load_rvc_settings(self) -> None:
+        """从持久化存储加载 RVC 设置并应用到 UI 控件"""
+        try:
+            rvc = self.settings_store.load_rvc()
+        except Exception:
+            return
+
+        # 滑条控件
+        self.rvc_pitch_shift.slider.setValue(int(rvc.get("pitch_shift", 0)))
+        self.rvc_index_rate.slider.setValue(int(rvc.get("index_rate", 75)))
+        self.rvc_filter_radius.slider.setValue(int(rvc.get("filter_radius", 3)))
+        self.rvc_rms_mix_rate.slider.setValue(int(rvc.get("rms_mix_rate", 25)))
+
+        # 下拉框
+        f0_method = rvc.get("f0_method", "rmvpe")
+        idx = self.rvc_f0_method.findText(f0_method)
+        if idx >= 0:
+            self.rvc_f0_method.setCurrentIndex(idx)
+
+        resample_sr = str(rvc.get("resample_sr", "0"))
+        idx = self.rvc_resample_sr.findText(resample_sr)
+        if idx >= 0:
+            self.rvc_resample_sr.setCurrentIndex(idx)
+
+        # 复选框
+        self.rvc_protect_voiceless.setChecked(bool(rvc.get("protect_voiceless", True)))
+        self.rvc_is_half.setChecked(bool(rvc.get("is_half", True)))
+
+        # 音频设备（按名称匹配）
+        input_name = rvc.get("input_device_name", "")
+        output_name = rvc.get("output_device_name", "")
+        if input_name:
+            for i in range(self.rvc_input_device.count()):
+                if self.rvc_input_device.itemText(i) == input_name:
+                    self.rvc_input_device.setCurrentIndex(i)
+                    break
+        if output_name:
+            for i in range(self.rvc_output_device.count()):
+                if self.rvc_output_device.itemText(i) == output_name:
+                    self.rvc_output_device.setCurrentIndex(i)
+                    break
+
+    def _save_rvc_settings(self) -> None:
+        """将当前 RVC UI 控件的值保存到持久化存储"""
+        try:
+            input_name = self.rvc_input_device.currentText() if self.rvc_input_device.count() > 0 else ""
+            output_name = self.rvc_output_device.currentText() if self.rvc_output_device.count() > 0 else ""
+
+            rvc = {
+                "pitch_shift": self.rvc_pitch_shift.value(),
+                "f0_method": self.rvc_f0_method.currentText(),
+                "index_rate": self.rvc_index_rate.value(),
+                "filter_radius": self.rvc_filter_radius.value(),
+                "rms_mix_rate": self.rvc_rms_mix_rate.value(),
+                "resample_sr": self.rvc_resample_sr.currentText(),
+                "protect_voiceless": self.rvc_protect_voiceless.isChecked(),
+                "is_half": self.rvc_is_half.isChecked(),
+                "input_device_name": input_name,
+                "output_device_name": output_name,
+            }
+            self.settings_store.save_rvc(rvc)
+        except Exception as e:
+            print(f"保存RVC设置失败: {e}")
+
+    def _refresh_rvc_model_list(self) -> None:
+        self.rvc_model_combo.clear()
+        rvc_models = [entry for entry in self.model_entries if entry.kind == "rvc"]
+        for model in rvc_models:
+            status = "●" if model.active else ""
+            display_text = f"{model.name} {status}"
+            self.rvc_model_combo.addItem(display_text, model.name)
+
+    def _refresh_audio_devices(self) -> None:
+        try:
+            import sounddevice as sd
+
+            # 获取所有设备
+            devices = sd.query_devices()
+            # 记住当前已选设备，刷新后恢复，避免重新选择
+            input_name = self.rvc_input_device.currentText() if self.rvc_input_device.count() > 0 else ""
+            output_name = self.rvc_output_device.currentText() if self.rvc_output_device.count() > 0 else ""
+
+            # 过滤掉明显的虚拟/映射/多余设备，并按名称去重
+            filter_keywords = [
+                "mapper", "映射器",
+                "primary", "主声音",
+                "stereo mix", "立体声混音",
+                "loopback", "环回",
+                "wave", "streaming", "steam",
+                "message", "系统声音",
+            ]
+            output_hints = ["扬声器", "speaker", "耳机", "headphone", "hd audio output", "output"]
+            input_hints = ["麦克风", "microphone", "mic", "input", "line in"]
+            virtual_cable_hints = ["vb-audio", "vb cable", "virtual cable", "voice meeter", "cable"]
+            input_map: dict[str, int] = {}
+            output_map: dict[str, int] = {}
+            for i in range(len(devices)):
+                device = devices[i]
+                device_name = str(device["name"]).strip()
+                # 过滤掉空名字 / 空括号的设备
+                if not device_name or device_name.endswith("()"):
+                    continue
+                # 过滤掉虚拟/映射/多余设备
+                if any(keyword in device_name.lower() for keyword in filter_keywords):
+                    continue
+                # 虚拟声卡（如 VB-Cable）按真实通道分类；普通设备再按名称区分输入/输出
+                is_virtual_cable = any(k in device_name.lower() for k in virtual_cable_hints)
+                is_output_like = (not is_virtual_cable) and any(k in device_name.lower() for k in output_hints)
+                is_input_like = (not is_virtual_cable) and any(k in device_name.lower() for k in input_hints)
+                # 按名称去重，保留第一个出现的实际设备
+                if device["max_input_channels"] > 0 and not is_output_like and device_name not in input_map:
+                    input_map[device_name] = i
+                if device["max_output_channels"] > 0 and not is_input_like and device_name not in output_map:
+                    output_map[device_name] = i
+
+            # 刷新期间阻止触发保存，避免清空已选设备
+            self.rvc_input_device.blockSignals(True)
+            self.rvc_output_device.blockSignals(True)
+            self.rvc_input_device.clear()
+            self.rvc_output_device.clear()
+            for device_name, idx in input_map.items():
+                self.rvc_input_device.addItem(device_name, idx)
+            for device_name, idx in output_map.items():
+                self.rvc_output_device.addItem(device_name, idx)
+            self.rvc_input_device.blockSignals(False)
+            self.rvc_output_device.blockSignals(False)
+
+            # 恢复之前选中的设备
+            self._restore_device_selection(self.rvc_input_device, input_name)
+            self._restore_device_selection(self.rvc_output_device, output_name)
+            self._save_rvc_settings()
+
+        except ImportError:
+            pass
+        except Exception as e:
+            pass
+
+    def _restore_device_selection(self, combo, name: str) -> None:
+        """刷新后按名称恢复之前选中的设备。"""
+        if not name:
+            return
+        for i in range(combo.count()):
+            if combo.itemText(i) == name:
+                combo.setCurrentIndex(i)
+                return
+
+    def _setup_virtual_audio(self) -> None:
+        """一键启用虚拟声卡：检测到就自动配置；没检测到就引导安装内置的 VB-Cable。"""
+        self._refresh_audio_devices()
+        found = self._find_virtual_cable_index()
+        if found >= 0:
+            device_name = self.rvc_output_device.itemText(found)
+            self.rvc_output_device.setCurrentIndex(found)
+            self._save_rvc_settings()
+            self._set_audio_hint(
+                f"已把输出设备设为：{device_name}。回到要实时变声的软件里，"
+                "把它的麦克风选成同一个虚拟声卡的输出端（如 CABLE Output），别人即可听到变声。"
+            )
+            return
+
+        # 已装驱动但设备未生效（往往需重启），不要重复启动安装程序，避免“Remove Driver”循环
+        if self._is_vbcable_installed():
+            self._set_audio_hint(
+                "VB-Cable 驱动已安装，但设备尚未生效。请先重启系统，"
+                "重启后设备会出现在列表里；之后点“一键启用虚拟声卡”即可自动配置。"
+            )
+            return
+
+        installer = self._prepare_vbcable_installer()
+        if installer is None:
+            self._set_audio_hint(
+                "未检测到虚拟声卡，且未找到内置的 VB-Cable 安装包。请联网后重试，"
+                "或手动下载 VB-Cable 后再次点击。",
+                ok=False,
+            )
+            return
+
+        if self._launch_elevated(installer):
+            self._set_audio_hint(
+                "已启动 VB-Cable 安装程序。请按提示完成安装（可能需要管理员权限，个别情况需重启），"
+                "完成后回来点一下“一键启用虚拟声卡”即可自动配置。"
+            )
+        else:
+            self._set_audio_hint(
+                "无法自动启动 VB-Cable 安装程序，请手动以管理员身份运行安装包。",
+                ok=False,
+            )
+
+    def _find_virtual_cable_index(self) -> int:
+        """在输出设备里查找虚拟声卡（VB-Cable / VoiceMeeter 等）。"""
+        target_names = [
+            "cable input", "cable a", "cable b",
+            "vb-audio", "vb cable", "virtual cable", "voice meeter",
+        ]
+        for i in range(self.rvc_output_device.count()):
+            name = self.rvc_output_device.itemText(i).lower()
+            if any(target in name for target in target_names):
+                return i
+        return -1
+
+    def _is_vbcable_installed(self) -> bool:
+        """检查系统是否已安装 VB-Cable 驱动（驱动仓库或驱动目录）。"""
+        try:
+            system_root = Path(os.environ.get("SystemRoot", r"C:\Windows"))
+            # Windows 驱动仓库里会出现 vbMmeCable / vbaudio / vbcable 的驱动包
+            file_repo = system_root / "System32" / "DriverStore" / "FileRepository"
+            if file_repo.exists():
+                for child in file_repo.iterdir():
+                    name = child.name.lower()
+                    if "vbmmecable" in name or "vbaudio" in name or "vbcable" in name:
+                        return True
+            # 驱动目录里已落盘的 sys 文件
+            drivers_dir = system_root / "System32" / "drivers"
+            for name in ("vbMmeCable64_win10.sys", "vbaudio_cable64_win10.sys", "vbaudio_cable_win7.sys"):
+                if (drivers_dir / name).exists():
+                    return True
+            return False
+        except Exception:
+            return False
+
+    def _prepare_vbcable_installer(self) -> Path | None:
+        """把随应用打包的 VB-Cable 安装程序解压出来，返回其路径。"""
+        candidates = [
+            RESOURCES_DIR / "vbcable" / "VBCABLE_Driver_Pack45.zip",
+            Path(__file__).resolve().parents[2] / "resources" / "vbcable" / "VBCABLE_Driver_Pack45.zip",
+        ]
+        zip_path = next((candidate for candidate in candidates if candidate.exists()), None)
+        if zip_path is None:
+            return None
+        try:
+            import struct
+            import zipfile
+            is_64 = struct.calcsize("P") * 8 == 64
+            setup_name = "VBCABLE_Setup_x64.exe" if is_64 else "VBCABLE_Setup.exe"
+            target_dir = Path.home() / ".star_string" / "vbcable"
+            target_dir.mkdir(parents=True, exist_ok=True)
+            # 安装程序需要同目录下的 .inf/.sys/.cat 驱动文件，必须解压整个驱动包
+            with zipfile.ZipFile(zip_path) as archive:
+                archive.extractall(target_dir)
+            setup_path = target_dir / setup_name
+            return setup_path if setup_path.exists() else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _launch_elevated(exe: Path) -> bool:
+        """以管理员权限启动安装程序（Windows）。"""
+        try:
+            import ctypes
+            result = ctypes.windll.shell32.ShellExecuteW(
+                None, "runas", str(exe), None, None, 1
+            )
+            return result > 32
+        except Exception:
+            return False
+
+    def _set_audio_hint(self, text: str, ok: bool = True) -> None:
+        label = getattr(self, "rvc_audio_hint", None)
+        if label is not None:
+            label.setText(text)
+            label.setStyleSheet("color: #7EE7FF;" if ok else "color: #FFC36B;")
+
+    def _on_rvc_status_changed(self, text: str, running: bool) -> None:
+        """工作线程通过信号更新 RVC 状态与按钮（主线程执行）。"""
+        label = getattr(self, "rvc_status", None)
+        if label is not None:
+            label.setText(text)
+        if hasattr(self, "rvc_start_button"):
+            self.rvc_start_button.show() if not running else self.rvc_start_button.hide()
+        if hasattr(self, "rvc_stop_button"):
+            self.rvc_stop_button.hide() if not running else self.rvc_stop_button.show()
+
+    def _on_rvc_start(self) -> None:
+        try:
+            if self.rvc_model_combo.currentIndex() < 0 or self.rvc_model_combo.currentData() is None:
+                show_info(self, "星弦", "请先选择一个RVC模型")
+                return
+
+            model_name = self.rvc_model_combo.currentData()
+
+            # 检查设备选择，如果设备列表为空则提示刷新
+            if self.rvc_input_device.count() == 0 or self.rvc_output_device.count() == 0:
+                show_info(self, "星弦", "请先刷新设备列表")
+                return
+
+            input_device_idx = self.rvc_input_device.currentData()
+            output_device_idx = self.rvc_output_device.currentData()
+
+            if input_device_idx is None or output_device_idx is None:
+                show_info(self, "星弦", "请选择输入和输出设备")
+                return
+
+            # 查找模型文件路径
+            model_entry = None
+            for entry in self.model_entries:
+                if entry.kind == "rvc" and entry.name == model_name:
+                    model_entry = entry
+                    break
+            if model_entry is None:
+                show_info(self, "星弦", "未找到所选模型")
+                return
+
+            model_path = model_entry.path
+            index_path = model_entry.extra_path or None
+            # If extra_path points to a .json config, ignore it for index
+            if index_path and not index_path.endswith(".index"):
+                index_path = None
+
+            # 获取参数（从滑条控件读取）
+            pitch_shift = self.rvc_pitch_shift.value()
+            f0_method = self.rvc_f0_method.currentText()
+            index_rate = self.rvc_index_rate.value() / 100.0  # 滑条 0-100 -> 0.0-1.0
+            filter_radius = self.rvc_filter_radius.value()
+            rms_mix_rate = self.rvc_rms_mix_rate.value() / 100.0  # 滑条 0-100 -> 0.0-1.0
+            resample_sr = int(self.rvc_resample_sr.currentText())
+            is_half = self.rvc_is_half.isChecked()
+
+            # 保存当前设置
+            self._save_rvc_settings()
+
+            # 更新UI状态
+            self._rvc_running = True
+            self.rvc_status.setText("状态：加载模型中...")
+            self.rvc_current_model.setText(f"当前模型：{model_name}")
+            self.rvc_start_button.hide()
+            self.rvc_stop_button.show()
+
+            # 启动音频处理线程（传递所有RVC参数）
+            self._start_audio_processing(
+                input_device_idx, output_device_idx,
+                model_path=model_path,
+                index_path=index_path,
+                pitch_shift=pitch_shift,
+                f0_method=f0_method,
+                index_rate=index_rate,
+                filter_radius=filter_radius,
+                rms_mix_rate=rms_mix_rate,
+                resample_sr=resample_sr,
+                is_half=is_half,
+            )
+
+        except Exception as e:
+            show_info(self, "星弦", f"启动失败：{str(e)}")
+            self._rvc_running = False
+            self.rvc_status.setText("状态：启动失败")
+            self.rvc_start_button.show()
+            self.rvc_stop_button.hide()
+
+    def _on_rvc_stop(self) -> None:
+        self._save_rvc_settings()
+        self._rvc_running = False
+        self.rvc_status.setText("状态：停止中...")
+        self._stop_audio_processing()
+        self.rvc_status.setText("状态：已停止")
+        self.rvc_current_model.setText("当前模型：未选择")
+        self.rvc_start_button.show()
+        self.rvc_stop_button.hide()
+
+    def _start_audio_processing(
+        self,
+        input_device_idx: int,
+        output_device_idx: int,
+        model_path: str = "",
+        index_path: str | None = None,
+        pitch_shift: int = 0,
+        f0_method: str = "rmvpe",
+        index_rate: float = 0.75,
+        filter_radius: int = 3,
+        rms_mix_rate: float = 0.25,
+        resample_sr: int = 0,
+        is_half: bool = False,
+    ) -> None:
+        """启动音频处理线程"""
+        try:
+            import sounddevice as sd
+
+            self._rvc_audio_thread = threading.Thread(
+                target=self._audio_worker,
+                args=(input_device_idx, output_device_idx),
+                kwargs=dict(
+                    model_path=model_path,
+                    index_path=index_path,
+                    pitch_shift=pitch_shift,
+                    f0_method=f0_method,
+                    index_rate=index_rate,
+                    filter_radius=filter_radius,
+                    rms_mix_rate=rms_mix_rate,
+                    resample_sr=resample_sr,
+                    is_half=is_half,
+                ),
+                daemon=True,
+            )
+            self._rvc_audio_thread.start()
+        except ImportError:
+            show_info(self, "星弦", "需要安装 sounddevice 库")
+        except Exception as e:
+            show_info(self, "星弦", f"音频处理启动失败：{str(e)}")
+
+    def _stop_audio_processing(self) -> None:
+        """停止音频处理"""
+        self._rvc_running = False
+        if hasattr(self, '_rvc_audio_thread') and self._rvc_audio_thread is not None:
+            self._rvc_audio_thread.join(timeout=3.0)
+            self._rvc_audio_thread = None
+
+    def _audio_worker(
+        self,
+        input_device_idx: int,
+        output_device_idx: int,
+        model_path: str = "",
+        index_path: str | None = None,
+        pitch_shift: int = 0,
+        f0_method: str = "rmvpe",
+        index_rate: float = 0.75,
+        filter_radius: int = 3,
+        rms_mix_rate: float = 0.25,
+        resample_sr: int = 0,
+        is_half: bool = False,
+    ) -> None:
+        """音频处理工作线程 — 使用RVC引擎进行实时变声"""
+        try:
+            import sounddevice as sd
+
+            # 初始化RVC引擎
+            engine = RVCEngine()
+            try:
+                engine.load_model(
+                    model_path=model_path,
+                    index_path=index_path,
+                    is_half=is_half,
+                )
+            except Exception as e:
+                print(f"RVC模型加载失败: {e}")
+                self.rvc_status_changed.emit("状态：模型加载失败", False)
+                return
+
+            sample_rate = engine.sample_rate
+            chunk_size = _gram_sample_length(sample_rate)
+
+            # 通过信号在主线更新状态
+            self.rvc_status_changed.emit("状态：运行中", True)
+
+            def audio_callback(indata, outdata, frames, time_info, status):
+                if status:
+                    print(f"音频状态: {status}")
+
+                if not self._rvc_running:
+                    return
+
+                try:
+                    # 输入音频转为 float32 mono
+                    audio_in = indata[:, 0].copy().astype(np.float32)
+                    input_volume = min(int(np.sqrt(np.mean(audio_in ** 2)) * 100), 100)
+                except Exception:
+                    audio_in = indata[:, 0].copy().astype(np.float32)
+                    input_volume = 0
+
+                output_volume = 0
+                try:
+                    # RVC 变声
+                    audio_out = engine.convert_chunk(
+                        audio_in,
+                        pitch_shift=pitch_shift,
+                        f0_method=f0_method,
+                        index_rate=index_rate,
+                        rms_mix_rate=rms_mix_rate,
+                        resample_sr=resample_sr,
+                        filter_radius=filter_radius,
+                    )
+
+                    # 确保输出长度匹配
+                    out_len = len(audio_out)
+                    if out_len >= frames:
+                        outdata[:, 0] = audio_out[:frames]
+                    else:
+                        outdata[:out_len, 0] = audio_out
+                        outdata[out_len:, 0] = 0.0
+                    output_volume = min(int(np.sqrt(np.mean(outdata[:, 0] ** 2)) * 100), 100)
+                except Exception as e:
+                    print(f"RVC处理异常: {e}")
+                    outdata[:] = indata  # 直通，避免完全没声音
+
+                # 无论转换成功与否都刷新音量显示（音频监控）
+                self._update_volume_display(input_volume, output_volume)
+
+            # 启动音频流
+            with sd.Stream(
+                device=(input_device_idx, output_device_idx),
+                channels=1,
+                samplerate=sample_rate,
+                blocksize=chunk_size,
+                callback=audio_callback,
+            ):
+                while self._rvc_running:
+                    sd.sleep(100)
+
+        except Exception as e:
+            print(f"音频处理错误: {str(e)}")
+            self.rvc_status_changed.emit(f"状态：音频流启动失败：{str(e)[:80]}", False)
+
+    def _update_volume_display(self, input_volume: int, output_volume: int) -> None:
+        """更新音量显示（工作线程调用，经信号切回主线程）。"""
+        self.rvc_volume_updated.emit(input_volume, output_volume)
+
+    def _on_rvc_volume_updated(self, input_volume: int, output_volume: int) -> None:
+        """在主线程中更新音量UI"""
+        self.rvc_input_volume_bar.setValue(input_volume)
+        self.rvc_input_volume_label.setText(f"{input_volume}%")
+        self.rvc_output_volume_bar.setValue(output_volume)
+        self.rvc_output_volume_label.setText(f"{output_volume}%")
