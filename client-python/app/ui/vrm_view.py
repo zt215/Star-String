@@ -52,7 +52,15 @@ class VRMView(QOpenGLWidget, ModelViewInterface):
         # 动画计时
         self._timer = QTimer(self)
         self._timer.timeout.connect(self.update)
-        self._timer.start(33)  # ~30 FPS
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if not self._timer.isActive():
+            self._timer.start(33)  # ~30 FPS
+
+    def hideEvent(self, event) -> None:
+        self._timer.stop()
+        super().hideEvent(event)
 
     # ---- ModelViewInterface ----
     def model_type(self) -> ModelType:

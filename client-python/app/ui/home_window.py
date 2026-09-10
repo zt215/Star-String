@@ -2,10 +2,19 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 import numpy as np
 from pathlib import Path
 
-from PySide6.QtCore import QEasingCurve, QPointF, QPropertyAnimation, QRect, Qt, Signal
+from PySide6.QtCore import (
+    QEasingCurve,
+    QPointF,
+    QPropertyAnimation,
+    QRect,
+    Qt,
+    QTimer,
+    Signal,
+)
 from PySide6.QtGui import QCloseEvent, QColor, QIcon, QPainter, QPixmap, QPolygonF
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -21,6 +30,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -42,6 +52,7 @@ from PySide6.QtWidgets import (
 from app.services.auth_service import LoginError, get_profile, update_profile
 from app.services.cloud_service import (
     CloudApiError,
+    check_server,
     delete_cloud_model,
     delete_cloud_preset,
     download_cloud_model,
@@ -56,7 +67,7 @@ from app.services.model_store import (
     ModelStore,
 )
 from app.services.rvc_service import RVCEngine, _gram_sample_length
-from app.services.motion_capture import MotionCapture
+from app.services.motion_capture import MotionCapture, list_camera_devices
 from app.services.settings_store import SettingsStore
 from app.ui.dialogs import show_info, show_warning
 from app.ui.live2d_view import Live2DView
@@ -415,6 +426,25 @@ QPushButton#smallGhostButton:hover {
     border-color: #4AA9E8;
 }
 
+QPushButton#smallActionButton {
+    background-color: #1E6FD9;
+    color: #FFFFFF;
+    border: 1px solid #3580E8;
+    border-radius: 6px;
+    padding: 3px 12px;
+    min-height: 26px;
+    min-width: 0;
+    font-weight: 600;
+}
+
+QPushButton#smallActionButton:hover {
+    background-color: #2F80E6;
+}
+
+QPushButton#smallActionButton:pressed {
+    background-color: #1A60C2;
+}
+
 QSlider#rvcSlider {
     min-height: 20px;
 }
@@ -578,6 +608,8 @@ class HomeWindow(QMainWindow):
     cloud_presets_error = Signal(str)
     rvc_status_changed = Signal(str, bool)
     rvc_volume_updated = Signal(int, int)
+    server_status_changed = Signal(bool, str)
+    camera_devices_loaded = Signal(list, bool)
 
     def __init__(self, account: str | None = None, offline: bool = False) -> None:
         super().__init__()
@@ -594,6 +626,7 @@ class HomeWindow(QMainWindow):
         self.model_entries = self.model_store.load()
         self.settings_store = SettingsStore(store_account)
         self.motion_settings = self.settings_store.load_motion()
+        self.system_settings = self.settings_store.load_system()
         self.motion_capture = MotionCapture()
         self.motion_capture.frame_ready.connect(self._on_motion_frame)
         self.motion_capture.drive_changed.connect(self._on_motion_drive)
@@ -606,9 +639,16 @@ class HomeWindow(QMainWindow):
         self._avatar_running_before_capture = False  # 动捕开始前模型是否已启动
         self._avatar_kind = "live2d"  # 虚拟形象页当前模型类型（live2d / vrm）
 
+        self._closing = False
+        self._camera_devices: list = []
+        self._motion_running = False
+        self._smooth_in = 0.0
+        self._smooth_out = 0.0
+        self._last_volume_emit = 0.0
         icon_path = ICON_PATH if ICON_PATH.exists() else LOGO_PATH
         self.setWindowIcon(QIcon(str(icon_path)))
         self.setCentralWidget(self._build_ui())
+        self._place_live2d_for_page(self.pages.currentIndex())
         self._sync_preview_views()
         self.profile_loaded.connect(self._on_profile_loaded)
         self.profile_load_error.connect(self._on_profile_load_error)
@@ -622,9 +662,18 @@ class HomeWindow(QMainWindow):
         self.cloud_presets_error.connect(self._on_cloud_presets_error)
         self.rvc_status_changed.connect(self._on_rvc_status_changed)
         self.rvc_volume_updated.connect(self._on_rvc_volume_updated)
+        self.server_status_changed.connect(self._on_server_status_changed)
+        self.camera_devices_loaded.connect(self._on_camera_devices_loaded)
+        self._start_server_monitor()
+        self._refresh_camera_devices()
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        self._closing = True
+        timer = getattr(self, "_server_timer", None)
+        if timer is not None:
+            timer.stop()
         self._save_rvc_settings()
+        self._save_system_settings()
         self._shutdown_live2d()
         self.motion_capture.shutdown()
         super().closeEvent(event)
@@ -736,13 +785,15 @@ class HomeWindow(QMainWindow):
         self.nav_group.buttons()[0].setChecked(True)
         layout.addStretch()
 
-        profile = QLabel("配置：日常直播")
-        profile.setStyleSheet("color: #9DB5D8; font-size: 12px;")
-        layout.addWidget(profile)
+        self.scheme_label = QLabel(
+            f"配置：{self.system_settings.get('scheme_name', '日常直播')}"
+        )
+        self.scheme_label.setStyleSheet("color: #9DB5D8; font-size: 12px;")
+        layout.addWidget(self.scheme_label)
 
-        status = QLabel("服务器已连接")
-        status.setStyleSheet("color: #9DB5D8; font-size: 12px;")
-        layout.addWidget(status)
+        self.server_status_label = QLabel("服务器：检测中")
+        self.server_status_label.setStyleSheet("color: #9DB5D8; font-size: 12px;")
+        layout.addWidget(self.server_status_label)
         return sidebar
 
     def _build_pages(self) -> QStackedWidget:
@@ -758,6 +809,10 @@ class HomeWindow(QMainWindow):
         self.nav_group.setExclusive(True)
         self._place_live2d_for_page(index)
         self._sync_preview_views()
+        if index == 0:
+            self._sync_home_devices_from_page()
+        if index in (1, 6):
+            self._refresh_camera_devices(force=False)
         if index == 2:  # RVC页面
             self._refresh_audio_devices()
         if index == 7:
@@ -772,7 +827,7 @@ class HomeWindow(QMainWindow):
             return
         if index == 0:
             holder = getattr(self, "home_preview_holder", None)
-            vrm_host = getattr(self, "avatar_preview_holder", None)
+            vrm_host = holder
         elif index == 1:
             holder = getattr(self, "motion_avatar_holder", None)
             vrm_host = getattr(self, "motion_avatar_holder", None)
@@ -810,7 +865,7 @@ class HomeWindow(QMainWindow):
 
         if index == 0:
             # 首页预览区：Live2D / VRM 二选一
-            shared_vrm = getattr(self, "vrm_view", None)
+            shared_vrm = getattr(self, "avatar_vrm_view", None)
             if shared is None or shared_vrm is None:
                 return
             if not running:
@@ -818,8 +873,8 @@ class HomeWindow(QMainWindow):
                 shared_vrm.hide()
                 return
             model_type = "live2d"
-            if hasattr(self, "home_model_type_combo"):
-                model_type = self.home_model_type_combo.currentText().lower()
+            if hasattr(self, "home_type_tabs"):
+                model_type = "vrm" if self.home_type_tabs.currentIndex() >= 1 else "live2d"
             if model_type == "vrm":
                 shared.hide()
                 shared_vrm.show()
@@ -904,14 +959,18 @@ class HomeWindow(QMainWindow):
 
         controls_card, controls_box = self._make_clickable_card("动捕控制", "controls")
         cam_row = QHBoxLayout()
-        cam_row.addWidget(self._form_label("摄像头编号"))
-        self.motion_camera_spin = ArrowSpinBox()
-        self.motion_camera_spin.setObjectName("inputBox")
-        self.motion_camera_spin.setRange(0, 9)
-        self.motion_camera_spin.setValue(int(self.motion_settings.get("camera_index", 0)))
-        self.motion_camera_spin.valueChanged.connect(self._on_motion_camera_changed)
-        cam_row.addWidget(self.motion_camera_spin, 1)
+        cam_row.addWidget(self._form_label("摄像头设备"))
+        self.motion_camera_combo = ArrowComboBox()
+        self.motion_camera_combo.setObjectName("inputBox")
+        self._configure_device_combo(self.motion_camera_combo, 160, 320)
+        self.motion_camera_combo.currentIndexChanged.connect(self._on_motion_camera_changed)
+        cam_row.addWidget(self.motion_camera_combo, 1)
+        cam_refresh = QPushButton("刷新")
+        cam_refresh.setObjectName("smallGhostButton")
+        cam_refresh.clicked.connect(lambda: self._refresh_camera_devices(force=True))
+        cam_row.addWidget(cam_refresh)
         controls_box.addLayout(cam_row)
+        self._populate_camera_combo(self.motion_camera_combo)
 
         self.motion_mirror = QCheckBox("镜像画面")
         self.motion_mirror.setObjectName("toggle")
@@ -1011,6 +1070,38 @@ class HomeWindow(QMainWindow):
         inner.setContentsMargins(0, 0, 0, 0)
         inner.setSpacing(8)
         scroll.setWidget(content)
+        layout.addWidget(scroll, 1)
+        return panel, inner
+
+    def _make_home_card(self, title: str, key: str):
+        """首页卡片：标题可点击放大，内容放进滚动区避免压缩变形。"""
+        panel = QFrame()
+        panel.setObjectName("panel")
+        panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(6)
+        header = ClickableLabel(title)
+        header.setObjectName("panelTitle")
+        header.setCursor(Qt.PointingHandCursor)
+        header.setToolTip("点击放大，再次点击还原")
+        header.clicked.connect(lambda: self._toggle_home_focus(key))
+        layout.addWidget(header)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setStyleSheet(
+            "QScrollArea { background: transparent; border: none; }"
+            "QScrollArea > QWidget > QWidget { background: transparent; }"
+        )
+        content = QWidget()
+        inner = QVBoxLayout(content)
+        inner.setContentsMargins(0, 0, 0, 0)
+        inner.setSpacing(8)
+        scroll.setWidget(content)
+        self.home_card_scrolls[key] = scroll
         layout.addWidget(scroll, 1)
         return panel, inner
 
@@ -1129,6 +1220,85 @@ class HomeWindow(QMainWindow):
         animation.start()
         self._motion_card_animation = animation
 
+    def _toggle_home_focus(self, key: str) -> None:
+        if self.home_focus_key == key:
+            self._exit_home_focus(key)
+        elif self.home_focus_key is not None:
+            self._exit_home_focus(self.home_focus_key, immediate=True)
+            self._enter_home_focus(key)
+        else:
+            self._enter_home_focus(key)
+
+    def _enter_home_focus(self, key: str) -> None:
+        keys = tuple(self.home_cards.keys())
+        layer = self.home_focus_layer
+        layer.setGeometry(self.home_area.rect())
+        focused_rect, others_rects = self._home_focus_geometry(
+            key, self.home_area.rect()
+        )
+        self._home_focus_to_grid = {}
+        for k in keys:
+            card = self.home_cards[k]
+            self._home_focus_to_grid[k] = card.geometry()
+            scroll = self.home_card_scrolls.get(k)
+            if scroll is not None:
+                scroll.setVerticalScrollBarPolicy(
+                    Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+                    if k == key
+                    else Qt.ScrollBarPolicy.ScrollBarAsNeeded
+                )
+            card.setParent(layer)
+            card.show()
+        self.home_focus_key = key
+        layer.show()
+        layer.raise_()
+        for k in keys:
+            card = self.home_cards[k]
+            start = self._home_focus_to_grid.get(k, card.geometry())
+            target = focused_rect if k == key else others_rects[k]
+            self._animate_card_geometry_once(card, start, target)
+
+    def _exit_home_focus(self, key: str, immediate: bool = False) -> None:
+        if immediate:
+            self._restore_after_home_focus(key)
+            return
+        card = self.home_cards[key]
+        start = card.geometry()
+        end = self._home_focus_to_grid.get(key, start)
+        self._animate_card_geometry_once(
+            card, start, end, lambda: self._restore_after_home_focus(key)
+        )
+        self.home_focus_key = None
+
+    def _restore_after_home_focus(self, key: str) -> None:
+        self.home_focus_layer.hide()
+        for scroll in self.home_card_scrolls.values():
+            scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        for k, card in self.home_cards.items():
+            card.setParent(self.home_area)
+            self._home_grid.addWidget(card, *self.home_card_pos[k])
+            card.show()
+        self.home_focus_key = None
+
+    def _home_focus_geometry(self, key: str, rect: QRect):
+        keys = tuple(self.home_cards.keys())
+        others = [k for k in keys if k != key]
+        big = QRect(0, 0, int(rect.width() * 0.62), rect.height())
+        side = QRect(
+            int(rect.width() * 0.62), 0, int(rect.width() * 0.38), rect.height()
+        )
+        count = max(1, len(others))
+        cell_h = side.height() // count
+        others_rects = {}
+        for index, other in enumerate(others):
+            others_rects[other] = QRect(
+                side.x() + 8,
+                side.y() + 8 + index * cell_h,
+                max(60, side.width() - 16),
+                max(60, cell_h - 16),
+            )
+        return big, others_rects
+
     def _apply_motion_settings(self) -> None:
         self.motion_capture.set_camera_index(int(self.motion_settings.get("camera_index", 0)))
         self.motion_capture.set_mirror(bool(self.motion_settings.get("mirror", True)))
@@ -1139,10 +1309,104 @@ class HomeWindow(QMainWindow):
     def _save_motion_settings(self) -> None:
         self.settings_store.save_motion(self.motion_settings)
 
-    def _on_motion_camera_changed(self, value: int) -> None:
-        self.motion_settings["camera_index"] = value
-        self.motion_capture.set_camera_index(value)
+    def _on_motion_camera_changed(self, index: int) -> None:
+        camera_index = self.motion_camera_combo.currentData()
+        if camera_index is None:
+            return
+        self.motion_settings["camera_index"] = int(camera_index)
+        self.motion_capture.set_camera_index(int(camera_index))
         self._save_motion_settings()
+        self._sync_camera_combos()
+
+    def _on_home_motion_camera_changed(self, index: int) -> None:
+        combo = getattr(self, "home_motion_camera_combo", None)
+        if combo is None:
+            return
+        camera_index = combo.currentData()
+        if camera_index is None:
+            return
+        self.motion_settings["camera_index"] = int(camera_index)
+        self.motion_capture.set_camera_index(int(camera_index))
+        self._save_motion_settings()
+        self._sync_camera_combos()
+
+    def _populate_camera_combo(self, combo, devices: list | None = None) -> None:
+        """填充摄像头设备下拉，并选中已保存的设备。"""
+        if combo is None:
+            return
+        saved = int(self.motion_settings.get("camera_index", 0))
+        if devices is None:
+            devices = getattr(self, "_camera_devices", None) or [
+                (saved, "点击「刷新」扫描摄像头")
+            ]
+        combo.blockSignals(True)
+        combo.clear()
+        for index, label in devices:
+            combo.addItem(str(label), int(index))
+        if combo.count() == 0:
+            combo.addItem("点击「刷新」扫描摄像头", saved)
+        target = combo.findData(saved)
+        combo.setCurrentIndex(target if target >= 0 else 0)
+        combo.blockSignals(False)
+
+    def _refresh_camera_devices(self, force: bool = False) -> None:
+        """刷新摄像头列表。
+
+        默认只读取已保存的列表，不会打开摄像头；只有点击“刷新”
+        （``force=True``）时才真正探测一次并保存结果。
+        """
+        if not force:
+            saved = self.system_settings.get("camera_devices")
+            devices: list = []
+            if isinstance(saved, list):
+                for item in saved:
+                    try:
+                        devices.append((int(item[0]), str(item[1])))
+                    except (TypeError, ValueError, IndexError):
+                        continue
+            if devices:
+                self._on_camera_devices_loaded(devices, persist=False)
+            return
+
+        def worker() -> None:
+            try:
+                devices = list_camera_devices(force=True)
+            except Exception:
+                devices = []
+            self.camera_devices_loaded.emit(devices, True)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_camera_devices_loaded(self, devices: list, persist: bool = False) -> None:
+        if getattr(self, "_closing", False):
+            return
+        self._camera_devices = list(devices)
+        self._populate_camera_combo(getattr(self, "motion_camera_combo", None), devices)
+        self._populate_camera_combo(getattr(self, "cfg_camera_combo", None), devices)
+        self._populate_camera_combo(
+            getattr(self, "home_motion_camera_combo", None), devices
+        )
+        if persist and devices:
+            self.system_settings["camera_devices"] = [
+                [int(index), str(name)] for index, name in devices
+            ]
+            self._save_system_settings()
+
+    def _sync_camera_combos(self) -> None:
+        """按当前 camera_index 同步两处摄像头下拉的选中项。"""
+        saved = int(self.motion_settings.get("camera_index", 0))
+        for combo in (
+            getattr(self, "motion_camera_combo", None),
+            getattr(self, "cfg_camera_combo", None),
+            getattr(self, "home_motion_camera_combo", None),
+        ):
+            if combo is None:
+                continue
+            target = combo.findData(saved)
+            if target >= 0:
+                combo.blockSignals(True)
+                combo.setCurrentIndex(target)
+                combo.blockSignals(False)
 
     def _on_motion_mirror_changed(self, checked: bool) -> None:
         self.motion_settings["mirror"] = checked
@@ -1172,6 +1436,17 @@ class HomeWindow(QMainWindow):
         if self.motion_capture.start():
             self.motion_start_button.hide()
             self.motion_stop_button.show()
+            home_start = getattr(self, "home_motion_start_button", None)
+            if home_start is not None:
+                home_start.hide()
+            home_stop = getattr(self, "home_motion_stop_button", None)
+            if home_stop is not None:
+                home_stop.show()
+            self._motion_running = True
+            self._reset_motion_preview("正在启动摄像头…")
+            home_stack = getattr(self, "home_motion_stack", None)
+            if home_stack is not None:
+                home_stack.setCurrentIndex(1)
             self.motion_status.setText("动捕运行中")
             # 动捕期间让头像保持显示并可被驱动；若此前未启动，结束后回退
             self._avatar_running = True
@@ -1185,8 +1460,19 @@ class HomeWindow(QMainWindow):
 
     def _on_motion_stop(self) -> None:
         self.motion_capture.stop()
+        self._motion_running = False
         self.motion_start_button.show()
         self.motion_stop_button.hide()
+        home_start = getattr(self, "home_motion_start_button", None)
+        if home_start is not None:
+            home_start.show()
+        home_stop = getattr(self, "home_motion_stop_button", None)
+        if home_stop is not None:
+            home_stop.hide()
+        home_stack = getattr(self, "home_motion_stack", None)
+        if home_stack is not None:
+            home_stack.setCurrentIndex(0)
+        self._reset_motion_preview()
         self.motion_status.setText("动捕已停止")
         # 若动捕前模型未启动，则停止后回退到未启动状态
         if not getattr(self, "_avatar_running_before_capture", False):
@@ -1199,6 +1485,8 @@ class HomeWindow(QMainWindow):
             self.live2d_view.start_idle()
 
     def _on_motion_frame(self, image) -> None:
+        if not getattr(self, "_motion_running", False):
+            return
         source = QPixmap.fromImage(image)
         for label in (getattr(self, "motion_preview", None), getattr(self, "home_motion_preview", None)):
             if label is None:
@@ -1215,6 +1503,15 @@ class HomeWindow(QMainWindow):
             else:
                 pixmap = source
             label.setPixmap(pixmap)
+
+    def _reset_motion_preview(self, text: str = "动捕未开启") -> None:
+        """清空上一帧画面，恢复为未开启提示。"""
+        for attr in ("motion_preview", "home_motion_preview"):
+            label = getattr(self, attr, None)
+            if label is None:
+                continue
+            label.clear()
+            label.setText(text)
 
     def _on_motion_drive(self, drive: dict) -> None:
         # 根据当前模型类型传递动捕数据
@@ -1238,10 +1535,14 @@ class HomeWindow(QMainWindow):
         if getattr(self, "home_motion_status", None) is not None:
             self.home_motion_status.setText(text)
 
-    def cfg_camera_spin_changed(self, value: int) -> None:
-        self.motion_settings["camera_index"] = value
-        self.motion_capture.set_camera_index(value)
+    def cfg_camera_changed(self, index: int) -> None:
+        camera_index = self.cfg_camera_combo.currentData()
+        if camera_index is None:
+            return
+        self.motion_settings["camera_index"] = int(camera_index)
+        self.motion_capture.set_camera_index(int(camera_index))
         self._save_motion_settings()
+        self._sync_camera_combos()
 
     def cfg_engine_changed(self, index: int) -> None:
         engine = ("hybrid", "face", "yolo")[min(index, 2)]
@@ -1266,94 +1567,370 @@ class HomeWindow(QMainWindow):
         if not checked and getattr(self, "live2d_view", None) is not None:
             self.live2d_view.reset_drive()
 
+    @staticmethod
+    def _set_combo_text(combo: QComboBox, text: str) -> None:
+        for i in range(combo.count()):
+            if combo.itemText(i) == text:
+                combo.setCurrentIndex(i)
+                return
+
+    def cfg_scheme_name_changed(self, text: str) -> None:
+        self.system_settings["scheme_name"] = text.strip()
+        self._update_scheme_label()
+
+    def cfg_resolution_changed(self, index: int) -> None:
+        self.system_settings["video_resolution"] = self.cfg_resolution.currentText()
+        self._save_system_settings()
+
+    def cfg_fps_changed(self, value: int) -> None:
+        self.system_settings["video_fps"] = value
+        self._save_system_settings()
+
+    def cfg_sample_rate_changed(self, index: int) -> None:
+        self.system_settings["audio_sample_rate"] = self.cfg_sample_rate.currentText()
+        self._save_system_settings()
+
+    def cfg_audio_engine_changed(self, index: int) -> None:
+        self.system_settings["audio_engine"] = self.cfg_audio_engine.currentText()
+        self._save_system_settings()
+
+    def _on_save_system_settings(self) -> None:
+        name = self.cfg_scheme_name.text().strip()
+        if not name:
+            show_info(self, "星弦", "请输入配置方案名称")
+            return
+        self.system_settings["scheme_name"] = name
+        self._save_system_settings()
+        show_info(self, "星弦", f"已保存方案：{name}")
+
+    def _save_system_settings(self) -> None:
+        self._update_scheme_label()
+        self.settings_store.save_system(self.system_settings)
+
+    def _update_scheme_label(self) -> None:
+        label = getattr(self, "scheme_label", None)
+        if label is None:
+            return
+        name = self.system_settings.get("scheme_name") or "未命名方案"
+        label.setText(f"配置：{name}")
+
+    def _refresh_system_settings_view(self) -> None:
+        if getattr(self, "cfg_scheme_name", None) is None:
+            return
+        self.cfg_scheme_name.setText(self.system_settings.get("scheme_name", "日常直播"))
+        self._set_combo_text(
+            self.cfg_resolution, self.system_settings.get("video_resolution", "1080P")
+        )
+        self.cfg_fps.setValue(int(self.system_settings.get("video_fps", 60)))
+        self._set_combo_text(
+            self.cfg_sample_rate, self.system_settings.get("audio_sample_rate", "48000 Hz")
+        )
+        self._set_combo_text(
+            self.cfg_audio_engine, self.system_settings.get("audio_engine", "RVC")
+        )
+
+    def _start_server_monitor(self) -> None:
+        if self.offline:
+            self._on_server_status_changed(False, "离线模式")
+            return
+        self._check_server_async()
+        self._server_timer = QTimer(self)
+        self._server_timer.setInterval(15000)
+        self._server_timer.timeout.connect(self._check_server_async)
+        self._server_timer.start()
+
+    def _check_server_async(self) -> None:
+        def worker() -> None:
+            connected, detail = check_server()
+            self.server_status_changed.emit(connected, detail)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_server_status_changed(self, connected: bool, detail: str) -> None:
+        if getattr(self, "_closing", False):
+            return
+        label = getattr(self, "server_status_label", None)
+        if label is None:
+            return
+        if self.offline:
+            label.setText("服务器：离线模式")
+            label.setStyleSheet("color: #FFC36B; font-size: 12px;")
+            return
+        if connected:
+            label.setText(f"服务器：{detail}")
+            label.setStyleSheet("color: #7EE7FF; font-size: 12px;")
+        else:
+            label.setText("服务器：未连接")
+            label.setStyleSheet("color: #FF7E7E; font-size: 12px;")
+
     def _build_home_page(self) -> QWidget:
         page = QWidget()
-        grid = QGridLayout(page)
-        grid.setContentsMargins(24, 20, 24, 24)
-        grid.setSpacing(14)
+        page_layout = QVBoxLayout(page)
+        page_layout.setContentsMargins(24, 20, 24, 24)
+        page_layout.setSpacing(0)
 
-        avatar_card, avatar_box = _make_card("虚拟形象实时预览")
+        self.home_area = QWidget()
+        grid = QGridLayout(self.home_area)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setSpacing(14)
+        self._home_grid = grid
+        self.home_focus_key = None
+        self.home_cards: dict = {}
+        self.home_card_scrolls: dict = {}
+        self.home_card_pos = {
+            "avatar": (0, 0, 2, 1),
+            "motion": (0, 1, 1, 1),
+            "rvc": (0, 2, 1, 1),
+            "live": (1, 1, 1, 2),
+        }
+
+        avatar_card, avatar_box = self._make_home_card("虚拟形象预览", "avatar")
+        self.home_cards["avatar"] = avatar_card
+
+        # 模型类型 Tabs（替代下拉菜单）
+        type_row = QHBoxLayout()
+        type_row.setSpacing(8)
+        type_row.addWidget(self._form_label("模型类型"))
+        self.home_type_tabs = QTabBar()
+        self.home_type_tabs.setObjectName("avatarTypeTabs")
+        self.home_type_tabs.addTab("Live2D")
+        self.home_type_tabs.addTab("VRM")
+        self.home_type_tabs.currentChanged.connect(self._on_home_type_changed)
+        self.home_type_tabs.blockSignals(True)
+        self.home_type_tabs.setCurrentIndex(0)
+        self.home_type_tabs.blockSignals(False)
+        type_row.addWidget(self.home_type_tabs)
+        type_row.addStretch()
+        avatar_box.addLayout(type_row)
+
+        # 两态容器：未启动显示模型列表，启动后显示预览框
+        self.home_preview_stack = QStackedWidget()
+
+        list_page = QWidget()
+        list_layout = QVBoxLayout(list_page)
+        list_layout.setContentsMargins(0, 0, 0, 0)
+        list_layout.setSpacing(8)
+        self.home_model_list = QListWidget()
+        self.home_model_list.setObjectName("modelList")
+        self.home_model_list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.home_model_list.currentItemChanged.connect(self._on_home_model_selected)
+        list_layout.addWidget(self.home_model_list, 1)
+        start_row = QHBoxLayout()
+        start_row.addStretch()
+        self.home_preview_start_button = QPushButton("启动预览")
+        self.home_preview_start_button.setObjectName("actionButton")
+        self.home_preview_start_button.clicked.connect(self._on_home_preview_start)
+        start_row.addWidget(self.home_preview_start_button)
+        start_row.addStretch()
+        list_layout.addLayout(start_row)
+        self.home_preview_stack.addWidget(list_page)
+
+        preview_page = QWidget()
+        preview_layout = QVBoxLayout(preview_page)
+        preview_layout.setContentsMargins(0, 0, 0, 0)
+        preview_layout.setSpacing(8)
+
         self.home_preview_holder = QFrame()
         self.home_preview_holder.setObjectName("stagePanel")
-        home_holder_layout = QVBoxLayout(self.home_preview_holder)
-        home_holder_layout.setContentsMargins(8, 8, 8, 8)
-        home_holder_layout.setSpacing(0)
+        holder_layout = QVBoxLayout(self.home_preview_holder)
+        holder_layout.setContentsMargins(8, 8, 8, 8)
+        holder_layout.setSpacing(0)
         self.live2d_view = Live2DView()
         self.live2d_view.model_loaded.connect(self._on_live2d_loaded)
         self.live2d_view.model_error.connect(self._on_live2d_error)
-        home_holder_layout.addWidget(self.live2d_view, 1)
-        
-        # VRM 视图支持
-        self.vrm_view = VRMView()
-        self.vrm_view.model_loaded.connect(self._on_vrm_loaded)
-        self.vrm_view.model_error.connect(self._on_vrm_error)
-        home_holder_layout.addWidget(self.vrm_view, 1)
-        self.vrm_view.hide()  # 默认隐藏，根据模型类型切换显示
-        
-        # 模型类型切换器
-        home_model_type_layout = QHBoxLayout()
-        home_model_type_layout.setSpacing(8)
-        self.home_model_type_combo = QComboBox()
-        self.home_model_type_combo.setObjectName("navButton")
-        self.home_model_type_combo.addItems(["Live2D", "VRM"])
-        self.home_model_type_combo.currentTextChanged.connect(self._on_home_model_type_changed)
-        home_model_type_layout.addWidget(QLabel("模型类型："))
-        home_model_type_layout.addWidget(self.home_model_type_combo)
-        home_model_type_layout.addStretch()
-        avatar_box.addLayout(home_model_type_layout)
-        
-        avatar_box.addWidget(self.home_preview_holder, 1)
+        holder_layout.addWidget(self.live2d_view, 1)
+        preview_layout.addWidget(self.home_preview_holder, 1)
+
+        # 左右标签切换模型
+        switch_row = QHBoxLayout()
+        switch_row.setSpacing(8)
+        self.home_prev_button = QPushButton("‹")
+        self.home_prev_button.setObjectName("smallGhostButton")
+        self.home_prev_button.setFixedSize(40, 28)
+        self.home_prev_button.clicked.connect(self._on_home_prev_model)
+        switch_row.addWidget(self.home_prev_button)
+        self.home_current_model_label = QLabel("--")
+        self.home_current_model_label.setAlignment(Qt.AlignCenter)
+        self.home_current_model_label.setObjectName("infoValue")
+        switch_row.addWidget(self.home_current_model_label, 1)
+        self.home_next_button = QPushButton("›")
+        self.home_next_button.setObjectName("smallGhostButton")
+        self.home_next_button.setFixedSize(40, 28)
+        self.home_next_button.clicked.connect(self._on_home_next_model)
+        switch_row.addWidget(self.home_next_button)
+        preview_layout.addLayout(switch_row)
+
+        stop_row = QHBoxLayout()
+        stop_row.addStretch()
+        self.home_preview_stop_button = QPushButton("停止")
+        self.home_preview_stop_button.setObjectName("ghostButton")
+        self.home_preview_stop_button.clicked.connect(self._on_home_preview_stop)
+        stop_row.addWidget(self.home_preview_stop_button)
+        stop_row.addStretch()
+        preview_layout.addLayout(stop_row)
+
+        self.home_preview_stack.addWidget(preview_page)
+        self.home_preview_stack.setCurrentIndex(0)
+
+        avatar_box.addWidget(self.home_preview_stack, 1)
         self.home_avatar_status = QLabel("")
         self.home_avatar_status.setObjectName("panelBody")
         avatar_box.addWidget(self.home_avatar_status)
-        grid.addWidget(avatar_card, 0, 0, 2, 1)
+        grid.addWidget(avatar_card, *self.home_card_pos["avatar"])
 
-        camera_card, camera_box = _make_card("动捕画面 / 关键点")
-        self.home_motion_preview = QLabel("摄像头未连接")
+        camera_card, camera_box = self._make_home_card("动捕控制", "motion")
+        self.home_cards["motion"] = camera_card
+
+        self.home_motion_stack = QStackedWidget()
+
+        motion_device_page = QWidget()
+        motion_device_layout = QVBoxLayout(motion_device_page)
+        motion_device_layout.setContentsMargins(0, 0, 0, 0)
+        motion_device_layout.setSpacing(8)
+        motion_device_layout.addWidget(self._form_label("摄像头设备"))
+        self.home_motion_camera_combo = ArrowComboBox()
+        self.home_motion_camera_combo.setObjectName("inputBox")
+        self._configure_device_combo(self.home_motion_camera_combo, 160, 320)
+        self.home_motion_camera_combo.currentIndexChanged.connect(
+            self._on_home_motion_camera_changed
+        )
+        motion_device_layout.addWidget(self.home_motion_camera_combo)
+        home_cam_refresh = QPushButton("刷新设备")
+        home_cam_refresh.setObjectName("smallGhostButton")
+        home_cam_refresh.clicked.connect(lambda: self._refresh_camera_devices(force=True))
+        motion_device_layout.addWidget(home_cam_refresh)
+        motion_device_layout.addStretch()
+        self._populate_camera_combo(self.home_motion_camera_combo)
+        self.home_motion_stack.addWidget(motion_device_page)
+
+        motion_preview_page = QWidget()
+        motion_preview_layout = QVBoxLayout(motion_preview_page)
+        motion_preview_layout.setContentsMargins(0, 0, 0, 0)
+        self.home_motion_preview = QLabel("动捕未开启")
         self.home_motion_preview.setAlignment(Qt.AlignCenter)
         self.home_motion_preview.setStyleSheet(
             "background-color: #0A142A; border: 1px solid #284064; border-radius: 8px; color: #A9C3E2;"
         )
-        self.home_motion_preview.setMinimumSize(260, 180)
+        self.home_motion_preview.setMinimumSize(180, 110)
         self.home_motion_preview.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
-        camera_box.addWidget(self.home_motion_preview, 1)
+        motion_preview_layout.addWidget(self.home_motion_preview, 1)
+        self.home_motion_stack.addWidget(motion_preview_page)
+        self.home_motion_stack.setCurrentIndex(0)
+        camera_box.addWidget(self.home_motion_stack, 1)
+
         self.home_motion_status = QLabel("设备：未连接")
         self.home_motion_status.setObjectName("panelBody")
         camera_box.addWidget(self.home_motion_status)
-        camera_box.addStretch()
-        grid.addWidget(camera_card, 0, 1)
+        motion_controls = QHBoxLayout()
+        motion_controls.setSpacing(8)
+        self.home_motion_start_button = QPushButton("开始动捕")
+        self.home_motion_start_button.setObjectName("actionButton")
+        self.home_motion_start_button.clicked.connect(self._on_motion_start)
+        self.home_motion_stop_button = QPushButton("停止动捕")
+        self.home_motion_stop_button.setObjectName("ghostButton")
+        self.home_motion_stop_button.clicked.connect(self._on_motion_stop)
+        self.home_motion_stop_button.hide()
+        motion_controls.addWidget(self.home_motion_start_button)
+        motion_controls.addWidget(self.home_motion_stop_button)
+        camera_box.addLayout(motion_controls)
+        grid.addWidget(camera_card, *self.home_card_pos["motion"])
 
-        active_rvc = self._active_rvc_entry()
-        rvc_name = active_rvc.name if active_rvc else "未选择"
-        voice_card, voice_box = _make_card("音频变声控制")
-        voice_status = QLabel(f"当前模型：{rvc_name}")
-        voice_status.setObjectName("infoValue")
-        voice_box.addWidget(voice_status)
-        voice_toggle = QCheckBox("启用 RVC 变声")
-        voice_toggle.setObjectName("toggle")
-        voice_box.addWidget(voice_toggle)
+        voice_card, voice_box = self._make_home_card("音频变声（RVC）", "rvc")
+        self.home_cards["rvc"] = voice_card
+        voice_box.addWidget(self._form_label("模型选择"))
+        self.home_rvc_model_combo = ArrowComboBox()
+        self.home_rvc_model_combo.setObjectName("inputBox")
+        self.home_rvc_model_combo.setMaximumWidth(200)
+        self.home_rvc_model_combo.currentIndexChanged.connect(self._on_home_rvc_model_changed)
+        voice_box.addWidget(self.home_rvc_model_combo)
+
+        self.home_rvc_stack = QStackedWidget()
+        device_page = QWidget()
+        device_layout = QVBoxLayout(device_page)
+        device_layout.setContentsMargins(0, 0, 0, 0)
+        device_layout.setSpacing(8)
+        input_row = QHBoxLayout()
+        input_row.setSpacing(8)
+        input_row.addWidget(self._form_label("输入设备"))
+        self.home_rvc_input_device = ArrowComboBox()
+        self.home_rvc_input_device.setObjectName("inputBox")
+        self._configure_device_combo(self.home_rvc_input_device, 150, 260)
+        self.home_rvc_input_device.currentIndexChanged.connect(self._on_home_rvc_input_changed)
+        input_row.addWidget(self.home_rvc_input_device, 1)
+        device_layout.addLayout(input_row)
+        output_row = QHBoxLayout()
+        output_row.setSpacing(8)
+        output_row.addWidget(self._form_label("输出设备"))
+        self.home_rvc_output_device = ArrowComboBox()
+        self.home_rvc_output_device.setObjectName("inputBox")
+        self._configure_device_combo(self.home_rvc_output_device, 150, 260)
+        self.home_rvc_output_device.currentIndexChanged.connect(self._on_home_rvc_output_changed)
+        output_row.addWidget(self.home_rvc_output_device, 1)
+        device_layout.addLayout(output_row)
+        refresh_row = QHBoxLayout()
+        refresh_row.setSpacing(8)
+        self.home_rvc_refresh_button = QPushButton("刷新设备")
+        self.home_rvc_refresh_button.setObjectName("smallGhostButton")
+        self.home_rvc_refresh_button.clicked.connect(self._refresh_rvc_devices_from_home)
+        refresh_row.addWidget(self.home_rvc_refresh_button)
+        refresh_row.addStretch()
+        device_layout.addLayout(refresh_row)
+        device_layout.addStretch()
+        self.home_rvc_stack.addWidget(device_page)
+
+        self.home_volume_meter = self._build_vertical_meter("home_rvc", compact=True)
+        meter_page = QWidget()
+        meter_layout = QVBoxLayout(meter_page)
+        meter_layout.setContentsMargins(0, 0, 0, 0)
+        meter_layout.addStretch(1)
+        meter_layout.addWidget(self.home_volume_meter)
+        meter_layout.addStretch(1)
+        self.home_rvc_stack.addWidget(meter_page)
+        self.home_rvc_stack.setCurrentIndex(0)
+        voice_box.addWidget(self.home_rvc_stack)
+
+        self.home_rvc_status = QLabel("当前模型：未选择")
+        self.home_rvc_status.setObjectName("infoValue")
+        voice_box.addWidget(self.home_rvc_status)
+        rvc_controls = QHBoxLayout()
+        rvc_controls.setSpacing(8)
+        self.home_rvc_start_button = QPushButton("启动变声")
+        self.home_rvc_start_button.setObjectName("actionButton")
+        self.home_rvc_start_button.clicked.connect(
+            lambda: self._on_rvc_start(self.home_rvc_model_combo)
+        )
+        self.home_rvc_stop_button = QPushButton("停止变声")
+        self.home_rvc_stop_button.setObjectName("ghostButton")
+        self.home_rvc_stop_button.clicked.connect(self._on_rvc_stop)
+        self.home_rvc_stop_button.hide()
+        rvc_controls.addWidget(self.home_rvc_start_button)
+        rvc_controls.addWidget(self.home_rvc_stop_button)
+        voice_box.addLayout(rvc_controls)
         voice_box.addStretch()
-        grid.addWidget(voice_card, 0, 2)
+        grid.addWidget(voice_card, *self.home_card_pos["rvc"])
 
-        live_card, live_box = _make_card("直播互动")
+        live_card, live_box = self._make_home_card("直播互动", "live")
+        self.home_cards["live"] = live_card
         live_hint = QLabel("弹幕 / 礼物 / 互动动作接入位")
         live_hint.setObjectName("panelBody")
         live_box.addWidget(live_hint)
         live_box.addStretch()
-        grid.addWidget(live_card, 1, 1, 1, 2)
-
-        output_card, output_box = _make_card("视频输出设置")
-        output_info = QLabel("输出分辨率 1080P · 帧率 60 · RTMP 推流地址待配置")
-        output_info.setObjectName("infoValue")
-        output_box.addWidget(output_info)
-        output_box.addStretch()
-        grid.addWidget(output_card, 2, 0, 1, 3)
+        grid.addWidget(live_card, *self.home_card_pos["live"])
 
         grid.setColumnStretch(0, 2)
         grid.setColumnStretch(1, 1)
         grid.setColumnStretch(2, 1)
-        grid.setRowStretch(0, 1)
-        grid.setRowStretch(1, 1)
+        grid.setRowStretch(0, 3)
+        grid.setRowStretch(1, 2)
+
+        self.home_focus_layer = QWidget(self.home_area)
+        self.home_focus_layer.setStyleSheet("background-color: #0A1020;")
+        self.home_focus_layer.setVisible(False)
+        page_layout.addWidget(self.home_area, 1)
+
+        self._refresh_home_model_list()
+        self._refresh_home_rvc_model_list()
+        self._refresh_home_rvc_devices()
         return page
 
     def _build_live2d_page(self) -> QWidget:
@@ -1606,7 +2183,6 @@ class HomeWindow(QMainWindow):
         self._avatar_running = False
         for view in (
             getattr(self, "live2d_view", None),
-            getattr(self, "vrm_view", None),
             getattr(self, "avatar_vrm_view", None),
             getattr(self, "avatar_live2d_view", None),
         ):
@@ -1648,9 +2224,322 @@ class HomeWindow(QMainWindow):
         self._sync_preview_views()
         self._refresh_drive_params_card()
 
-    def _on_home_model_type_changed(self, model_type: str) -> None:
-        """home 页面模型类型切换回调"""
+    def _on_home_type_changed(self, index: int) -> None:
+        """首页模型类型左右标签切换回调"""
+        self._avatar_kind = "live2d" if index <= 0 else "vrm"
+        self._refresh_home_model_list()
+        if getattr(self, "_avatar_running", False):
+            active = (
+                self._active_live2d_entry()
+                if self._avatar_kind == "live2d"
+                else self._active_vrm_entry()
+            )
+            if active is None:
+                self._on_home_preview_stop()
+                return
+            self._start_home_model(active.name)
+        else:
+            self._sync_preview_views()
+
+    def _refresh_home_model_list(self) -> None:
+        model_list = getattr(self, "home_model_list", None)
+        if model_list is None:
+            return
+        model_list.clear()
+        kind = self._current_avatar_kind()
+        running = getattr(self, "_avatar_running", False)
+        for entry in self.model_entries:
+            if entry.kind != kind:
+                continue
+            suffix = " [使用中]" if (entry.active and running) else ""
+            item = QListWidgetItem(f"{entry.name}{suffix}")
+            item.setData(Qt.UserRole, entry.name)
+            model_list.addItem(item)
+        active = (
+            self._active_live2d_entry()
+            if kind == "live2d"
+            else self._active_vrm_entry()
+        )
+        if active is not None:
+            for i in range(model_list.count()):
+                if model_list.item(i).data(Qt.UserRole) == active.name:
+                    model_list.setCurrentRow(i)
+                    break
+
+    def _on_home_model_selected(self, current, previous) -> None:
+        label = getattr(self, "home_avatar_status", None)
+        if label is not None and current is not None:
+            label.setText(f"已选择：{current.data(Qt.UserRole) or current.text()}")
+
+    def _on_home_preview_start(self) -> None:
+        if self.home_model_list.currentRow() < 0:
+            show_info(self, "星弦", "请先在列表中选择一个模型")
+            return
+        item = self.home_model_list.currentItem()
+        name = item.data(Qt.UserRole) or item.text()
+        self._start_home_model(name)
+
+    def _start_home_model(self, name: str, kind: str | None = None) -> None:
+        kind = kind or self._current_avatar_kind()
+        self.model_entries = self.model_store.set_active(kind, name)
+        self._avatar_running = True
+        self._refresh_home_model_list()
+        self._refresh_model_list(kind)
+        self.home_preview_stack.setCurrentIndex(1)
+        self.home_current_model_label.setText(name)
+        self.home_avatar_status.setText(f"已启动：{name}")
         self._sync_preview_views()
+
+    def _on_home_preview_stop(self) -> None:
+        self._avatar_running = False
+        for view in (
+            getattr(self, "live2d_view", None),
+        ):
+            if view is not None:
+                try:
+                    view.clear_model()
+                except Exception:
+                    pass
+        self.home_preview_stack.setCurrentIndex(0)
+        self.home_current_model_label.setText("--")
+        self.home_avatar_status.setText("已停止")
+        self._refresh_home_model_list()
+        self._sync_preview_views()
+
+    def _on_home_prev_model(self) -> None:
+        self._cycle_home_model(-1)
+
+    def _on_home_next_model(self) -> None:
+        self._cycle_home_model(1)
+
+    def _cycle_home_model(self, step: int) -> None:
+        kind = self._current_avatar_kind()
+        entries = [entry for entry in self.model_entries if entry.kind == kind]
+        if not entries:
+            return
+        active = (
+            self._active_live2d_entry()
+            if kind == "live2d"
+            else self._active_vrm_entry()
+        )
+        current_name = active.name if active else entries[0].name
+        idx = next(
+            (i for i, entry in enumerate(entries) if entry.name == current_name),
+            0,
+        )
+        idx = (idx + step) % len(entries)
+        self._start_home_model(entries[idx].name, kind)
+
+    def _refresh_home_rvc_model_list(self) -> None:
+        combo = getattr(self, "home_rvc_model_combo", None)
+        if combo is None:
+            return
+        combo.blockSignals(True)
+        combo.clear()
+        for entry in self.model_entries:
+            if entry.kind == "rvc":
+                combo.addItem(entry.name, entry.name)
+        combo.blockSignals(False)
+        active = self._active_rvc_entry()
+        if active is not None:
+            index = combo.findData(active.name)
+            if index >= 0:
+                combo.setCurrentIndex(index)
+        self._on_home_rvc_model_changed(combo.currentIndex())
+
+    def _on_home_rvc_model_changed(self, index: int) -> None:
+        name = self.home_rvc_model_combo.currentText()
+        if getattr(self, "home_rvc_status", None) is not None:
+            self.home_rvc_status.setText(f"当前模型：{name}")
+
+    def _on_home_rvc_input_changed(self, index: int) -> None:
+        self._sync_home_device_selection("input")
+
+    def _on_home_rvc_output_changed(self, index: int) -> None:
+        self._sync_home_device_selection("output")
+
+    def _sync_home_device_selection(self, which: str) -> None:
+        """首页设备发生变化时同步到音频变声页，保证启动使用同一设备。"""
+        home = getattr(self, f"home_rvc_{which}_device", None)
+        page = getattr(self, f"rvc_{which}_device", None)
+        if home is None:
+            return
+        name = home.currentText()
+        if page is not None:
+            page.blockSignals(True)
+            for i in range(page.count()):
+                if page.itemText(i) == name:
+                    page.setCurrentIndex(i)
+                    break
+            page.blockSignals(False)
+        rvc = self.settings_store.load_rvc()
+        rvc[f"{which}_device_name"] = name
+        self.settings_store.save_rvc(rvc)
+
+    def _sync_home_devices_from_page(self) -> None:
+        """从音频变声页回首页时，把页面已选设备同步到首页下拉。"""
+        for page_name, home_name in (
+            ("rvc_input_device", "home_rvc_input_device"),
+            ("rvc_output_device", "home_rvc_output_device"),
+        ):
+            page = getattr(self, page_name, None)
+            home = getattr(self, home_name, None)
+            if page is None or home is None or page.count() == 0:
+                continue
+            if home.currentText() == page.currentText():
+                continue
+            name = page.currentText()
+            home.blockSignals(True)
+            for i in range(home.count()):
+                if home.itemText(i) == name:
+                    home.setCurrentIndex(i)
+                    break
+            home.blockSignals(False)
+
+    def _refresh_home_rvc_devices(self) -> None:
+        in_combo = getattr(self, "home_rvc_input_device", None)
+        out_combo = getattr(self, "home_rvc_output_device", None)
+        if in_combo is None or out_combo is None:
+            return
+        try:
+            import sounddevice as sd
+            devices = sd.query_devices()
+        except ImportError:
+            return
+        except Exception:
+            return
+        input_map, output_map = self._device_maps(devices)
+        rvc = self.settings_store.load_rvc()
+        self._populate_device_combo(in_combo, input_map, rvc.get("input_device_name", ""))
+        self._populate_device_combo(out_combo, output_map, rvc.get("output_device_name", ""))
+
+    def _refresh_rvc_devices_from_home(self) -> None:
+        self._refresh_audio_devices()
+
+    @staticmethod
+    def _device_maps(devices) -> tuple[dict[str, int], dict[str, int]]:
+        """把设备列表按输入/输出归类去重，返回 (in_map, out_map)。"""
+        filter_keywords = [
+            "mapper", "映射器",
+            "primary", "主声音",
+            "stereo mix", "立体声混音",
+            "loopback", "环回",
+            "wave", "streaming", "steam",
+            "message", "系统声音",
+        ]
+        output_hints = ["扬声器", "speaker", "耳机", "headphone", "hd audio output", "output"]
+        input_hints = ["麦克风", "microphone", "mic", "input", "line in"]
+        virtual_cable_hints = ["vb-audio", "vb cable", "virtual cable", "voice meeter", "cable"]
+        input_map: dict[str, int] = {}
+        output_map: dict[str, int] = {}
+        for i in range(len(devices)):
+            device = devices[i]
+            device_name = str(device["name"]).strip()
+            if not device_name or device_name.endswith("()"):
+                continue
+            if any(keyword in device_name.lower() for keyword in filter_keywords):
+                continue
+            is_virtual_cable = any(k in device_name.lower() for k in virtual_cable_hints)
+            is_output_like = (
+                not is_virtual_cable
+                and any(k in device_name.lower() for k in output_hints)
+            )
+            is_input_like = (
+                not is_virtual_cable
+                and any(k in device_name.lower() for k in input_hints)
+            )
+            if (
+                device["max_input_channels"] > 0
+                and not is_output_like
+                and device_name not in input_map
+            ):
+                input_map[device_name] = i
+            if (
+                device["max_output_channels"] > 0
+                and not is_input_like
+                and device_name not in output_map
+            ):
+                output_map[device_name] = i
+        return input_map, output_map
+
+    @staticmethod
+    def _populate_device_combo(
+        combo,
+        mapping: dict[str, int],
+        restore_name: str,
+    ) -> None:
+        if combo is None:
+            return
+        combo.blockSignals(True)
+        combo.clear()
+        for name, idx in mapping.items():
+            combo.addItem(name, idx)
+        combo.blockSignals(False)
+        if restore_name:
+            for i in range(combo.count()):
+                if combo.itemText(i) == restore_name:
+                    combo.setCurrentIndex(i)
+                    break
+
+    @staticmethod
+    def _configure_device_combo(
+        combo,
+        min_width: int = 180,
+        max_width: int = 520,
+    ) -> None:
+        """设备下拉按可用宽度展开，避免过窄导致弹出列表溢出页面。"""
+        if combo is None:
+            return
+        combo.setMinimumWidth(min_width)
+        combo.setMaximumWidth(max_width)
+        combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+    def _build_vertical_meter(self, prefix: str, compact: bool = False) -> QFrame:
+        """构建竖向音量监听表，并把进度条/数值挂到 self.<prefix>_* 上。"""
+        meter = QFrame()
+        meter.setObjectName("panel")
+        if compact:
+            meter.setFixedHeight(146)
+            bar_width, bar_height = 22, 68
+        else:
+            meter.setFixedHeight(196)
+            bar_width, bar_height = 30, 100
+        meter.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        box = QVBoxLayout(meter)
+        box.setContentsMargins(14, 10, 14, 10)
+        box.setSpacing(8)
+        title = QLabel("音量监控")
+        title.setObjectName("panelTitle")
+        box.addWidget(title)
+        bars = QHBoxLayout()
+        bars.setSpacing(30)
+        bars.addStretch(1)
+        for key, label in (("input", "输入"), ("output", "输出")):
+            col = QVBoxLayout()
+            col.setSpacing(4)
+            bar = QProgressBar()
+            bar.setObjectName("volumeBar")
+            bar.setRange(0, 100)
+            bar.setValue(0)
+            bar.setTextVisible(False)
+            bar.setOrientation(Qt.Orientation.Vertical)
+            bar.setFixedWidth(bar_width)
+            bar.setFixedHeight(bar_height)
+            col.addWidget(bar, 0, Qt.AlignHCenter)
+            value_label = QLabel("0%")
+            value_label.setObjectName("infoValue")
+            value_label.setAlignment(Qt.AlignCenter)
+            col.addWidget(value_label)
+            name_label = QLabel(label)
+            name_label.setObjectName("hintText")
+            name_label.setAlignment(Qt.AlignCenter)
+            col.addWidget(name_label)
+            bars.addLayout(col)
+            setattr(self, f"{prefix}_{key}_volume_bar", bar)
+            setattr(self, f"{prefix}_{key}_volume_label", value_label)
+        bars.addStretch(1)
+        box.addLayout(bars, 1)
+        return meter
 
     def _on_avatar_live2d_loaded(self, ok: bool) -> None:
         """Live2D 模型加载成功回调"""
@@ -2137,15 +3026,34 @@ class HomeWindow(QMainWindow):
         title.setObjectName("pageTitle")
         layout.addWidget(title)
 
+        scheme_card, scheme_box = _make_card("配置方案")
+        scheme_row = QHBoxLayout()
+        scheme_row.addWidget(self._form_label("方案名称"))
+        self.cfg_scheme_name = QLineEdit()
+        self.cfg_scheme_name.setObjectName("inputBox")
+        self.cfg_scheme_name.setPlaceholderText("为当前设置命名，例如：日常直播")
+        self.cfg_scheme_name.setText(self.system_settings.get("scheme_name", "日常直播"))
+        self.cfg_scheme_name.textChanged.connect(self.cfg_scheme_name_changed)
+        scheme_row.addWidget(self.cfg_scheme_name, 1)
+        scheme_box.addLayout(scheme_row)
+        scheme_box.addWidget(
+            self._form_label("保存后，左下角将显示当前方案名称，并随账户独立保存。")
+        )
+        layout.addWidget(scheme_card)
+
         motion_card, motion_box = _make_card("动捕设置")
         cam_row = QHBoxLayout()
-        cam_row.addWidget(self._form_label("摄像头编号"))
-        self.cfg_camera_spin = ArrowSpinBox()
-        self.cfg_camera_spin.setObjectName("inputBox")
-        self.cfg_camera_spin.setRange(0, 9)
-        self.cfg_camera_spin.setValue(int(self.motion_settings.get("camera_index", 0)))
-        self.cfg_camera_spin.valueChanged.connect(self.cfg_camera_spin_changed)
-        cam_row.addWidget(self.cfg_camera_spin, 1)
+        cam_row.addWidget(self._form_label("摄像头设备"))
+        self.cfg_camera_combo = ArrowComboBox()
+        self.cfg_camera_combo.setObjectName("inputBox")
+        self._configure_device_combo(self.cfg_camera_combo, 160, 320)
+        self.cfg_camera_combo.currentIndexChanged.connect(self.cfg_camera_changed)
+        cam_row.addWidget(self.cfg_camera_combo, 1)
+        cfg_cam_refresh = QPushButton("刷新")
+        cfg_cam_refresh.setObjectName("smallGhostButton")
+        cfg_cam_refresh.clicked.connect(lambda: self._refresh_camera_devices(force=True))
+        cam_row.addWidget(cfg_cam_refresh)
+        self._populate_camera_combo(self.cfg_camera_combo)
         cam_row.addWidget(self._form_label("动捕引擎"))
         self.cfg_engine_combo = ArrowComboBox()
         self.cfg_engine_combo.setObjectName("inputBox")
@@ -2185,38 +3093,45 @@ class HomeWindow(QMainWindow):
 
         video_card, video_box = _make_card("视频输出")
         video_box.addWidget(self._form_label("输出分辨率"))
-        resolution = ArrowComboBox()
-        resolution.setObjectName("inputBox")
-        resolution.addItems(["1080P", "720P", "4K"])
-        video_box.addWidget(resolution)
+        self.cfg_resolution = ArrowComboBox()
+        self.cfg_resolution.setObjectName("inputBox")
+        self.cfg_resolution.addItems(["1080P", "720P", "4K"])
+        self._set_combo_text(self.cfg_resolution, self.system_settings.get("video_resolution", "1080P"))
+        self.cfg_resolution.currentIndexChanged.connect(self.cfg_resolution_changed)
+        video_box.addWidget(self.cfg_resolution)
         video_box.addWidget(self._form_label("帧率"))
-        fps = ArrowSpinBox()
-        fps.setObjectName("inputBox")
-        fps.setRange(24, 120)
-        fps.setValue(60)
-        video_box.addWidget(fps)
+        self.cfg_fps = ArrowSpinBox()
+        self.cfg_fps.setObjectName("inputBox")
+        self.cfg_fps.setRange(24, 120)
+        self.cfg_fps.setValue(int(self.system_settings.get("video_fps", 60)))
+        self.cfg_fps.valueChanged.connect(self.cfg_fps_changed)
+        video_box.addWidget(self.cfg_fps)
         video_box.addStretch()
         settings_row.addWidget(video_card, 1)
 
         audio_card, audio_box = _make_card("音频设置")
         audio_box.addWidget(self._form_label("采样率"))
-        sample = ArrowComboBox()
-        sample.setObjectName("inputBox")
-        sample.addItems(["44100 Hz", "48000 Hz", "96000 Hz"])
-        audio_box.addWidget(sample)
+        self.cfg_sample_rate = ArrowComboBox()
+        self.cfg_sample_rate.setObjectName("inputBox")
+        self.cfg_sample_rate.addItems(["44100 Hz", "48000 Hz", "96000 Hz"])
+        self._set_combo_text(self.cfg_sample_rate, self.system_settings.get("audio_sample_rate", "48000 Hz"))
+        self.cfg_sample_rate.currentIndexChanged.connect(self.cfg_sample_rate_changed)
+        audio_box.addWidget(self.cfg_sample_rate)
         audio_box.addWidget(self._form_label("变声引擎"))
-        engine = ArrowComboBox()
-        engine.setObjectName("inputBox")
-        engine.addItems(["RVC", "未启用"])
-        audio_box.addWidget(engine)
+        self.cfg_audio_engine = ArrowComboBox()
+        self.cfg_audio_engine.setObjectName("inputBox")
+        self.cfg_audio_engine.addItems(["RVC", "未启用"])
+        self._set_combo_text(self.cfg_audio_engine, self.system_settings.get("audio_engine", "RVC"))
+        self.cfg_audio_engine.currentIndexChanged.connect(self.cfg_audio_engine_changed)
+        audio_box.addWidget(self.cfg_audio_engine)
         audio_box.addStretch()
         settings_row.addWidget(audio_card, 1)
 
         layout.addLayout(settings_row, 1)
 
-        save_button = QPushButton("保存设置")
+        save_button = QPushButton("保存为方案")
         save_button.setObjectName("actionButton")
-        save_button.clicked.connect(lambda: show_info(self, "星弦", "设置保存功能待接入"))
+        save_button.clicked.connect(self._on_save_system_settings)
         save_row = QHBoxLayout()
         save_row.addStretch()
         save_row.addWidget(save_button)
@@ -2354,106 +3269,49 @@ class HomeWindow(QMainWindow):
         right_layout.setContentsMargins(16, 14, 16, 14)
         right_layout.setSpacing(12)
 
-        # 设备选择区域
+        # 音频设备选择区域（始终显示）
         device_title = QLabel("音频设备选择")
         device_title.setObjectName("panelTitle")
         right_layout.addWidget(device_title)
-
-        # 输入设备
         input_device_layout = QHBoxLayout()
         input_device_layout.setSpacing(8)
         input_device_layout.addWidget(self._form_label("输入设备："))
         self.rvc_input_device = ArrowComboBox()
         self.rvc_input_device.setObjectName("inputBox")
-        self.rvc_input_device.setMinimumWidth(200)
+        self._configure_device_combo(self.rvc_input_device, 200, 720)
         input_device_layout.addWidget(self.rvc_input_device, 1)
         right_layout.addLayout(input_device_layout)
-
-        # 输出设备
         output_device_layout = QHBoxLayout()
         output_device_layout.setSpacing(8)
         output_device_layout.addWidget(self._form_label("输出设备："))
         self.rvc_output_device = ArrowComboBox()
         self.rvc_output_device.setObjectName("inputBox")
-        self.rvc_output_device.setMinimumWidth(200)
+        self._configure_device_combo(self.rvc_output_device, 200, 720)
         output_device_layout.addWidget(self.rvc_output_device, 1)
         right_layout.addLayout(output_device_layout)
-
-        # 刷新设备按钮
         refresh_devices_button = QPushButton("刷新设备列表")
         refresh_devices_button.setObjectName("ghostButton")
         refresh_devices_button.clicked.connect(self._refresh_audio_devices)
         right_layout.addWidget(refresh_devices_button)
-
         setup_virtual_button = QPushButton("一键启用虚拟声卡")
         setup_virtual_button.setObjectName("actionButton")
         setup_virtual_button.clicked.connect(self._setup_virtual_audio)
         right_layout.addWidget(setup_virtual_button)
-
         self.rvc_audio_hint = QLabel("")
         self.rvc_audio_hint.setObjectName("hintText")
         self.rvc_audio_hint.setWordWrap(True)
         right_layout.addWidget(self.rvc_audio_hint)
 
-        right_layout.addSpacing(20)
-
         # 变声控制区域
         control_title = QLabel("变声控制")
         control_title.setObjectName("panelTitle")
         right_layout.addWidget(control_title)
-
-        # 状态显示
         self.rvc_status = QLabel("状态：未启动")
         self.rvc_status.setObjectName("infoValue")
         right_layout.addWidget(self.rvc_status)
-
-        # 当前模型显示
         self.rvc_current_model = QLabel("当前模型：未选择")
         self.rvc_current_model.setObjectName("panelBody")
         right_layout.addWidget(self.rvc_current_model)
-
-        right_layout.addSpacing(20)
-
-        # 音量监控区域
-        volume_title = QLabel("音量监控")
-        volume_title.setObjectName("panelTitle")
-        right_layout.addWidget(volume_title)
-
-        # 输入音量
-        input_volume_layout = QHBoxLayout()
-        input_volume_layout.setSpacing(8)
-        input_volume_layout.addWidget(self._form_label("输入音量："))
-        self.rvc_input_volume_bar = QProgressBar()
-        self.rvc_input_volume_bar.setObjectName("volumeBar")
-        self.rvc_input_volume_bar.setRange(0, 100)
-        self.rvc_input_volume_bar.setValue(0)
-        self.rvc_input_volume_bar.setTextVisible(False)
-        self.rvc_input_volume_bar.setFixedHeight(20)
-        input_volume_layout.addWidget(self.rvc_input_volume_bar, 1)
-        self.rvc_input_volume_label = QLabel("0%")
-        self.rvc_input_volume_label.setObjectName("infoValue")
-        self.rvc_input_volume_label.setFixedWidth(40)
-        input_volume_layout.addWidget(self.rvc_input_volume_label)
-        right_layout.addLayout(input_volume_layout)
-
-        # 输出音量
-        output_volume_layout = QHBoxLayout()
-        output_volume_layout.setSpacing(8)
-        output_volume_layout.addWidget(self._form_label("输出音量："))
-        self.rvc_output_volume_bar = QProgressBar()
-        self.rvc_output_volume_bar.setObjectName("volumeBar")
-        self.rvc_output_volume_bar.setRange(0, 100)
-        self.rvc_output_volume_bar.setValue(0)
-        self.rvc_output_volume_bar.setTextVisible(False)
-        self.rvc_output_volume_bar.setFixedHeight(20)
-        output_volume_layout.addWidget(self.rvc_output_volume_bar, 1)
-        self.rvc_output_volume_label = QLabel("0%")
-        self.rvc_output_volume_label.setObjectName("infoValue")
-        self.rvc_output_volume_label.setFixedWidth(40)
-        output_volume_layout.addWidget(self.rvc_output_volume_label)
-        right_layout.addLayout(output_volume_layout)
-
-        right_layout.addSpacing(20)
 
         # 开始/停止按钮
         control_buttons = QHBoxLayout()
@@ -2470,10 +3328,14 @@ class HomeWindow(QMainWindow):
         control_buttons.addStretch()
         right_layout.addLayout(control_buttons)
 
+        # 变声控制下方：竖向音量监听
+        right_layout.addSpacing(10)
+        self.rvc_volume_meter = self._build_vertical_meter("rvc")
+        right_layout.addWidget(self.rvc_volume_meter)
         right_layout.addStretch()
 
         content.addWidget(left_panel, 1)
-        content.addWidget(right_panel, 1)
+        content.addWidget(right_panel, 2)
         layout.addLayout(content, 1)
 
         # 初始化
@@ -2585,12 +3447,30 @@ class HomeWindow(QMainWindow):
             offline_hint.setWordWrap(True)
             layout.addWidget(offline_hint)
 
-        tabs = QTabWidget()
-        tabs.setObjectName("cloudTabs")
-        tabs.addTab(self._build_cloud_model_tab(), "云模型")
-        tabs.addTab(self._build_cloud_preset_tab(), "云端方案")
-        layout.addWidget(tabs, 1)
+        tabs_row = QHBoxLayout()
+        tabs_row.setSpacing(8)
+        self.cloud_tabs = QTabBar()
+        self.cloud_tabs.setObjectName("avatarTypeTabs")
+        self.cloud_tabs.addTab("云模型")
+        self.cloud_tabs.addTab("云端方案")
+        self.cloud_tabs.currentChanged.connect(self._on_cloud_tab_changed)
+        self.cloud_tabs.blockSignals(True)
+        self.cloud_tabs.setCurrentIndex(0)
+        self.cloud_tabs.blockSignals(False)
+        tabs_row.addWidget(self.cloud_tabs)
+        tabs_row.addStretch()
+        layout.addLayout(tabs_row)
+
+        self.cloud_stack = QStackedWidget()
+        self.cloud_stack.addWidget(self._build_cloud_model_tab())
+        self.cloud_stack.addWidget(self._build_cloud_preset_tab())
+        layout.addWidget(self.cloud_stack, 1)
         return page
+
+    def _on_cloud_tab_changed(self, index: int) -> None:
+        stack = getattr(self, "cloud_stack", None)
+        if stack is not None:
+            stack.setCurrentIndex(index)
 
     def _build_cloud_model_tab(self) -> QWidget:
         tab = QWidget()
@@ -2600,19 +3480,21 @@ class HomeWindow(QMainWindow):
 
         toolbar = QHBoxLayout()
         toolbar.setSpacing(8)
-        toolbar.addWidget(self._form_label("模型类型"))
-        self.cloud_kind_combo = ArrowComboBox()
-        self.cloud_kind_combo.setObjectName("inputBox")
-        self.cloud_kind_combo.addItems(["Live2D", "VRM", "RVC"])
-        self.cloud_kind_combo.setFixedWidth(120)
-        self.cloud_kind_combo.currentTextChanged.connect(self._on_cloud_kind_changed)
-        toolbar.addWidget(self.cloud_kind_combo)
+        self.cloud_kind_tabs = QTabBar()
+        self.cloud_kind_tabs.setObjectName("avatarTypeTabs")
+        for label in ("Live2D", "VRM", "RVC"):
+            self.cloud_kind_tabs.addTab(label)
+        self.cloud_kind_tabs.blockSignals(True)
+        self.cloud_kind_tabs.setCurrentIndex(0)
+        self.cloud_kind_tabs.blockSignals(False)
+        self.cloud_kind_tabs.currentChanged.connect(self._on_cloud_kind_changed)
+        toolbar.addWidget(self.cloud_kind_tabs)
         upload_button = QPushButton("上传模型")
-        upload_button.setObjectName("actionButton")
+        upload_button.setObjectName("smallActionButton")
         upload_button.clicked.connect(self._upload_cloud_model)
         toolbar.addWidget(upload_button)
         refresh_button = QPushButton("刷新")
-        refresh_button.setObjectName("ghostButton")
+        refresh_button.setObjectName("smallGhostButton")
         refresh_button.clicked.connect(self._refresh_cloud_models)
         toolbar.addWidget(refresh_button)
         toolbar.addStretch()
@@ -2626,13 +3508,13 @@ class HomeWindow(QMainWindow):
         actions = QHBoxLayout()
         actions.setSpacing(8)
         download_button = QPushButton("下载")
-        download_button.setObjectName("actionButton")
+        download_button.setObjectName("smallActionButton")
         download_button.clicked.connect(lambda _=False: self._cloud_action("download"))
         enable_button = QPushButton("启用")
-        enable_button.setObjectName("actionButton")
+        enable_button.setObjectName("smallActionButton")
         enable_button.clicked.connect(lambda _=False: self._cloud_action("enable"))
         delete_button = QPushButton("删除")
-        delete_button.setObjectName("ghostButton")
+        delete_button.setObjectName("smallGhostButton")
         delete_button.clicked.connect(lambda _=False: self._cloud_action("delete"))
         actions.addWidget(download_button)
         actions.addWidget(enable_button)
@@ -2650,13 +3532,15 @@ class HomeWindow(QMainWindow):
 
         toolbar = QHBoxLayout()
         toolbar.setSpacing(8)
-        toolbar.addWidget(self._form_label("方案类型"))
-        self.preset_kind_combo = ArrowComboBox()
-        self.preset_kind_combo.setObjectName("inputBox")
-        self.preset_kind_combo.addItems(["模型参数方案", "系统设置方案", "综合配置方案"])
-        self.preset_kind_combo.setFixedWidth(140)
-        self.preset_kind_combo.currentTextChanged.connect(self._on_preset_kind_changed)
-        toolbar.addWidget(self.preset_kind_combo)
+        self.preset_kind_tabs = QTabBar()
+        self.preset_kind_tabs.setObjectName("avatarTypeTabs")
+        for label in ("模型参数方案", "完整配置方案"):
+            self.preset_kind_tabs.addTab(label)
+        self.preset_kind_tabs.blockSignals(True)
+        self.preset_kind_tabs.setCurrentIndex(0)
+        self.preset_kind_tabs.blockSignals(False)
+        self.preset_kind_tabs.currentChanged.connect(self._on_preset_kind_changed)
+        toolbar.addWidget(self.preset_kind_tabs)
 
         self.preset_name_edit = QLineEdit()
         self.preset_name_edit.setObjectName("inputBox")
@@ -2665,11 +3549,11 @@ class HomeWindow(QMainWindow):
         toolbar.addWidget(self.preset_name_edit)
 
         upload_button = QPushButton("上传当前方案")
-        upload_button.setObjectName("actionButton")
+        upload_button.setObjectName("smallActionButton")
         upload_button.clicked.connect(self._upload_current_preset)
         toolbar.addWidget(upload_button)
         refresh_button = QPushButton("刷新")
-        refresh_button.setObjectName("ghostButton")
+        refresh_button.setObjectName("smallGhostButton")
         refresh_button.clicked.connect(self._refresh_cloud_presets)
         toolbar.addWidget(refresh_button)
         toolbar.addStretch()
@@ -2683,10 +3567,10 @@ class HomeWindow(QMainWindow):
         actions = QHBoxLayout()
         actions.setSpacing(8)
         apply_button = QPushButton("下载应用")
-        apply_button.setObjectName("actionButton")
+        apply_button.setObjectName("smallActionButton")
         apply_button.clicked.connect(self._apply_cloud_preset)
         delete_button = QPushButton("删除")
-        delete_button.setObjectName("ghostButton")
+        delete_button.setObjectName("smallGhostButton")
         delete_button.clicked.connect(self._delete_cloud_preset)
         actions.addWidget(apply_button)
         actions.addWidget(delete_button)
@@ -2719,7 +3603,7 @@ class HomeWindow(QMainWindow):
 
     def _render_cloud_models(self) -> None:
         """按当前模型类型过滤并刷新云端模型列表。"""
-        kind = self.cloud_kind_combo.currentText().lower() if hasattr(self, "cloud_kind_combo") else "live2d"
+        kind = self._current_cloud_kind()
         self.cloud_models = [item for item in self.cloud_all_models if item.get("kind") == kind]
         self.cloud_model_list.clear()
         if not self.cloud_models:
@@ -2740,8 +3624,14 @@ class HomeWindow(QMainWindow):
         else:
             self._set_cloud_status(f"共 {len(self.cloud_models)} 个云端模型")
 
-    def _on_cloud_kind_changed(self, _kind: str) -> None:
+    def _on_cloud_kind_changed(self, index: int) -> None:
         self._render_cloud_models()
+
+    def _current_cloud_kind(self) -> str:
+        tabs = getattr(self, "cloud_kind_tabs", None)
+        if tabs is None or tabs.currentIndex() < 0:
+            return "live2d"
+        return ("live2d", "vrm", "rvc")[min(tabs.currentIndex(), 2)]
 
     def _on_cloud_models_error(self, message: str) -> None:
         self._set_cloud_status(f"获取云端模型失败：{message}", ok=False)
@@ -2758,9 +3648,15 @@ class HomeWindow(QMainWindow):
     def _preset_kind_value(label: str) -> str:
         return {
             "模型参数方案": "param",
-            "系统设置方案": "system",
-            "综合配置方案": "config",
+            "完整配置方案": "config",
+            "系统设置方案": "system",  # 兼容旧方案
         }.get(label, "config")
+
+    def _current_preset_kind(self) -> str:
+        tabs = getattr(self, "preset_kind_tabs", None)
+        if tabs is None or tabs.currentIndex() < 0:
+            return "param"
+        return self._preset_kind_value(tabs.tabText(tabs.currentIndex()))
 
     def _refresh_cloud_presets(self) -> None:
         if getattr(self, "cloud_preset_list", None) is None:
@@ -2768,7 +3664,7 @@ class HomeWindow(QMainWindow):
         if self.offline:
             self._set_cloud_status("离线模式，无法访问云端", ok=False)
             return
-        kind = self._preset_kind_value(self.preset_kind_combo.currentText())
+        kind = self._current_preset_kind()
         self._set_cloud_status("正在获取云端方案...")
 
         def worker() -> None:
@@ -2798,19 +3694,25 @@ class HomeWindow(QMainWindow):
     def _on_cloud_presets_error(self, message: str) -> None:
         self._set_cloud_status(f"获取云端方案失败：{message}", ok=False)
 
-    def _on_preset_kind_changed(self, _label: str) -> None:
+    def _on_preset_kind_changed(self, index: int) -> None:
         self._refresh_cloud_presets()
 
     def _build_preset_content(self, kind: str) -> dict:
         motion = self.motion_settings
         if kind == "param":
             return {"params": motion.get("params", {})}
-        if kind == "system":
-            return {
-                key: motion.get(key)
-                for key in ("camera_index", "mirror", "lr_mirror", "sensitivity", "engine", "drive_enabled")
+        # 完整配置方案：动捕设置 + 系统设置
+        content = dict(motion)
+        content.update(
+            {
+                "scheme_name": self.system_settings.get("scheme_name", ""),
+                "video_resolution": self.system_settings.get("video_resolution", ""),
+                "video_fps": self.system_settings.get("video_fps", 60),
+                "audio_sample_rate": self.system_settings.get("audio_sample_rate", ""),
+                "audio_engine": self.system_settings.get("audio_engine", ""),
             }
-        return dict(motion)
+        )
+        return content
 
     def _upload_current_preset(self) -> None:
         if self.offline:
@@ -2820,7 +3722,7 @@ class HomeWindow(QMainWindow):
         if not name:
             show_info(self, "星弦", "请输入方案名称")
             return
-        kind = self._preset_kind_value(self.preset_kind_combo.currentText())
+        kind = self._current_preset_kind()
         content = self._build_preset_content(kind)
         payload = json.dumps(content, ensure_ascii=False)
         self._set_cloud_status(f"正在上传方案 {name}...")
@@ -2856,19 +3758,31 @@ class HomeWindow(QMainWindow):
 
     def _apply_preset_content(self, kind: str, content: dict) -> None:
         motion = self.motion_settings
+        if not isinstance(content, dict):
+            content = {}
         if kind == "param":
-            params = content.get("params", {}) if isinstance(content, dict) else {}
-            motion["params"] = params
+            motion["params"] = content.get("params", {})
         elif kind == "system":
             for key in ("camera_index", "mirror", "lr_mirror", "sensitivity", "engine", "drive_enabled"):
                 if key in content:
                     motion[key] = content[key]
+            for key in ("scheme_name", "video_resolution", "video_fps", "audio_sample_rate", "audio_engine"):
+                if key in content:
+                    self.system_settings[key] = content[key]
         else:
-            if isinstance(content, dict):
-                motion.update(content)
+            for key, value in content.items():
+                if key in ("camera_index", "mirror", "lr_mirror", "sensitivity", "engine", "drive_enabled"):
+                    motion[key] = value
+                elif key in ("scheme_name", "video_resolution", "video_fps", "audio_sample_rate", "audio_engine"):
+                    self.system_settings[key] = value
+                else:
+                    motion[key] = value
         self._save_motion_settings()
+        self._save_system_settings()
         self.motion_capture.set_drive_params(motion.get("params", {}))
         self._refresh_drive_params_card()
+        self._refresh_system_settings_view()
+        self._sync_camera_combos()
 
     def _delete_cloud_preset(self) -> None:
         if self.offline:
@@ -2911,7 +3825,7 @@ class HomeWindow(QMainWindow):
         if self.offline:
             self._set_cloud_status("离线模式，无法上传", ok=False)
             return
-        kind = self.cloud_kind_combo.currentText().lower()
+        kind = self._current_cloud_kind()
         filters = {
             "live2d": "Live2D (*.model3.json *.zip);;所有文件 (*)",
             "vrm": "VRM (*.vrm);;所有文件 (*)",
@@ -3196,86 +4110,54 @@ class HomeWindow(QMainWindow):
             print(f"保存RVC设置失败: {e}")
 
     def _refresh_rvc_model_list(self) -> None:
-        self.rvc_model_combo.clear()
-        rvc_models = [entry for entry in self.model_entries if entry.kind == "rvc"]
-        for model in rvc_models:
-            status = "●" if model.active else ""
-            display_text = f"{model.name} {status}"
-            self.rvc_model_combo.addItem(display_text, model.name)
+        combo = getattr(self, "rvc_model_combo", None)
+        if combo is not None:
+            combo.clear()
+            rvc_models = [entry for entry in self.model_entries if entry.kind == "rvc"]
+            for model in rvc_models:
+                status = "●" if model.active else ""
+                display_text = f"{model.name} {status}"
+                combo.addItem(display_text, model.name)
+        self._refresh_home_rvc_model_list()
 
     def _refresh_audio_devices(self) -> None:
         try:
             import sounddevice as sd
 
-            # 获取所有设备
             devices = sd.query_devices()
             # 记住当前已选设备，刷新后恢复，避免重新选择
-            input_name = self.rvc_input_device.currentText() if self.rvc_input_device.count() > 0 else ""
-            output_name = self.rvc_output_device.currentText() if self.rvc_output_device.count() > 0 else ""
+            input_name = (
+                self.rvc_input_device.currentText()
+                if self.rvc_input_device.count() > 0
+                else ""
+            )
+            output_name = (
+                self.rvc_output_device.currentText()
+                if self.rvc_output_device.count() > 0
+                else ""
+            )
+            if not input_name or not output_name:
+                rvc = self.settings_store.load_rvc()
+                input_name = input_name or rvc.get("input_device_name", "")
+                output_name = output_name or rvc.get("output_device_name", "")
 
-            # 过滤掉明显的虚拟/映射/多余设备，并按名称去重
-            filter_keywords = [
-                "mapper", "映射器",
-                "primary", "主声音",
-                "stereo mix", "立体声混音",
-                "loopback", "环回",
-                "wave", "streaming", "steam",
-                "message", "系统声音",
-            ]
-            output_hints = ["扬声器", "speaker", "耳机", "headphone", "hd audio output", "output"]
-            input_hints = ["麦克风", "microphone", "mic", "input", "line in"]
-            virtual_cable_hints = ["vb-audio", "vb cable", "virtual cable", "voice meeter", "cable"]
-            input_map: dict[str, int] = {}
-            output_map: dict[str, int] = {}
-            for i in range(len(devices)):
-                device = devices[i]
-                device_name = str(device["name"]).strip()
-                # 过滤掉空名字 / 空括号的设备
-                if not device_name or device_name.endswith("()"):
-                    continue
-                # 过滤掉虚拟/映射/多余设备
-                if any(keyword in device_name.lower() for keyword in filter_keywords):
-                    continue
-                # 虚拟声卡（如 VB-Cable）按真实通道分类；普通设备再按名称区分输入/输出
-                is_virtual_cable = any(k in device_name.lower() for k in virtual_cable_hints)
-                is_output_like = (not is_virtual_cable) and any(k in device_name.lower() for k in output_hints)
-                is_input_like = (not is_virtual_cable) and any(k in device_name.lower() for k in input_hints)
-                # 按名称去重，保留第一个出现的实际设备
-                if device["max_input_channels"] > 0 and not is_output_like and device_name not in input_map:
-                    input_map[device_name] = i
-                if device["max_output_channels"] > 0 and not is_input_like and device_name not in output_map:
-                    output_map[device_name] = i
+            input_map, output_map = self._device_maps(devices)
 
             # 刷新期间阻止触发保存，避免清空已选设备
-            self.rvc_input_device.blockSignals(True)
-            self.rvc_output_device.blockSignals(True)
-            self.rvc_input_device.clear()
-            self.rvc_output_device.clear()
-            for device_name, idx in input_map.items():
-                self.rvc_input_device.addItem(device_name, idx)
-            for device_name, idx in output_map.items():
-                self.rvc_output_device.addItem(device_name, idx)
-            self.rvc_input_device.blockSignals(False)
-            self.rvc_output_device.blockSignals(False)
-
-            # 恢复之前选中的设备
-            self._restore_device_selection(self.rvc_input_device, input_name)
-            self._restore_device_selection(self.rvc_output_device, output_name)
+            self._populate_device_combo(self.rvc_input_device, input_map, input_name)
+            self._populate_device_combo(self.rvc_output_device, output_map, output_name)
+            self._populate_device_combo(
+                getattr(self, "home_rvc_input_device", None), input_map, input_name
+            )
+            self._populate_device_combo(
+                getattr(self, "home_rvc_output_device", None), output_map, output_name
+            )
             self._save_rvc_settings()
 
         except ImportError:
             pass
         except Exception as e:
             pass
-
-    def _restore_device_selection(self, combo, name: str) -> None:
-        """刷新后按名称恢复之前选中的设备。"""
-        if not name:
-            return
-        for i in range(combo.count()):
-            if combo.itemText(i) == name:
-                combo.setCurrentIndex(i)
-                return
 
     def _setup_virtual_audio(self) -> None:
         """一键启用虚拟声卡：检测到就自动配置；没检测到就引导安装内置的 VB-Cable。"""
@@ -3393,23 +4275,49 @@ class HomeWindow(QMainWindow):
             label.setText(text)
             label.setStyleSheet("color: #7EE7FF;" if ok else "color: #FFC36B;")
 
+    def _set_rvc_mode(self, running: bool) -> None:
+        """首页 RVC：未启动显示设备选择，运行中切换为音量监听。"""
+        stack = getattr(self, "home_rvc_stack", None)
+        if stack is not None:
+            stack.setCurrentIndex(1 if running else 0)
+
     def _on_rvc_status_changed(self, text: str, running: bool) -> None:
         """工作线程通过信号更新 RVC 状态与按钮（主线程执行）。"""
+        self._set_rvc_mode(running)
         label = getattr(self, "rvc_status", None)
         if label is not None:
             label.setText(text)
+        home_status = getattr(self, "home_rvc_status", None)
+        if home_status is not None:
+            home_status.setText(text)
         if hasattr(self, "rvc_start_button"):
             self.rvc_start_button.show() if not running else self.rvc_start_button.hide()
         if hasattr(self, "rvc_stop_button"):
             self.rvc_stop_button.hide() if not running else self.rvc_stop_button.show()
+        home_start = getattr(self, "home_rvc_start_button", None)
+        if home_start is not None:
+            home_start.show() if not running else home_start.hide()
+        home_stop = getattr(self, "home_rvc_stop_button", None)
+        if home_stop is not None:
+            home_stop.hide() if not running else home_stop.show()
 
-    def _on_rvc_start(self) -> None:
+    def _on_rvc_start(self, combo: QComboBox | None = None) -> None:
         try:
-            if self.rvc_model_combo.currentIndex() < 0 or self.rvc_model_combo.currentData() is None:
+            combo = combo or self.rvc_model_combo
+            if combo.currentIndex() < 0 or combo.currentData() is None:
                 show_info(self, "星弦", "请先选择一个RVC模型")
                 return
 
-            model_name = self.rvc_model_combo.currentData()
+            model_name = combo.currentData()
+
+            # 首次启动时自动刷新设备，避免未进入音频变声页就无设备可选
+            if (
+                getattr(self, "rvc_input_device", None) is not None
+                and self.rvc_input_device.count() == 0
+                and getattr(self, "rvc_output_device", None) is not None
+                and self.rvc_output_device.count() == 0
+            ):
+                self._refresh_audio_devices()
 
             # 检查设备选择，如果设备列表为空则提示刷新
             if self.rvc_input_device.count() == 0 or self.rvc_output_device.count() == 0:
@@ -3457,6 +4365,15 @@ class HomeWindow(QMainWindow):
             self.rvc_current_model.setText(f"当前模型：{model_name}")
             self.rvc_start_button.hide()
             self.rvc_stop_button.show()
+            self._set_rvc_mode(True)
+            if hasattr(self, "home_rvc_status"):
+                self.home_rvc_status.setText(f"状态：加载模型中...")
+            home_start = getattr(self, "home_rvc_start_button", None)
+            if home_start is not None:
+                home_start.hide()
+            home_stop = getattr(self, "home_rvc_stop_button", None)
+            if home_stop is not None:
+                home_stop.show()
 
             # 启动音频处理线程（传递所有RVC参数）
             self._start_audio_processing(
@@ -3478,6 +4395,15 @@ class HomeWindow(QMainWindow):
             self.rvc_status.setText("状态：启动失败")
             self.rvc_start_button.show()
             self.rvc_stop_button.hide()
+            self._set_rvc_mode(False)
+            if hasattr(self, "home_rvc_status"):
+                self.home_rvc_status.setText("状态：启动失败")
+            home_start = getattr(self, "home_rvc_start_button", None)
+            if home_start is not None:
+                home_start.show()
+            home_stop = getattr(self, "home_rvc_stop_button", None)
+            if home_stop is not None:
+                home_stop.hide()
 
     def _on_rvc_stop(self) -> None:
         self._save_rvc_settings()
@@ -3488,6 +4414,15 @@ class HomeWindow(QMainWindow):
         self.rvc_current_model.setText("当前模型：未选择")
         self.rvc_start_button.show()
         self.rvc_stop_button.hide()
+        self._set_rvc_mode(False)
+        if hasattr(self, "home_rvc_status"):
+            self.home_rvc_status.setText("状态：已停止")
+        home_start = getattr(self, "home_rvc_start_button", None)
+        if home_start is not None:
+            home_start.show()
+        home_stop = getattr(self, "home_rvc_stop_button", None)
+        if home_stop is not None:
+            home_stop.hide()
 
     def _start_audio_processing(
         self,
@@ -3551,6 +4486,8 @@ class HomeWindow(QMainWindow):
         is_half: bool = False,
     ) -> None:
         """音频处理工作线程 — 使用RVC引擎进行实时变声"""
+        import queue
+
         try:
             import sounddevice as sd
 
@@ -3573,6 +4510,42 @@ class HomeWindow(QMainWindow):
             # 通过信号在主线更新状态
             self.rvc_status_changed.emit("状态：运行中", True)
 
+            input_q: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=4)
+            output_q: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=4)
+
+            def convert_worker() -> None:
+                while self._rvc_running:
+                    try:
+                        chunk = input_q.get(timeout=0.2)
+                    except queue.Empty:
+                        continue
+                    except Exception:
+                        break
+                    try:
+                        audio_out = engine.convert_chunk(
+                            chunk,
+                            pitch_shift=pitch_shift,
+                            f0_method=f0_method,
+                            index_rate=index_rate,
+                            rms_mix_rate=rms_mix_rate,
+                            resample_sr=resample_sr,
+                            filter_radius=filter_radius,
+                        )
+                    except Exception as e:
+                        print(f"RVC处理异常: {e}")
+                        audio_out = chunk
+                    try:
+                        output_q.get_nowait()  # 丢弃最旧，保证实时
+                    except queue.Empty:
+                        pass
+                    try:
+                        output_q.put_nowait(audio_out)
+                    except queue.Full:
+                        pass
+
+            conv_thread = threading.Thread(target=convert_worker, daemon=True)
+            conv_thread.start()
+
             def audio_callback(indata, outdata, frames, time_info, status):
                 if status:
                     print(f"音频状态: {status}")
@@ -3588,20 +4561,22 @@ class HomeWindow(QMainWindow):
                     audio_in = indata[:, 0].copy().astype(np.float32)
                     input_volume = 0
 
+                # 送入转换队列（满则丢弃最旧，保证实时）
+                try:
+                    input_q.put_nowait(audio_in)
+                except queue.Full:
+                    try:
+                        input_q.get_nowait()
+                    except queue.Empty:
+                        pass
+                    try:
+                        input_q.put_nowait(audio_in)
+                    except queue.Full:
+                        pass
+
                 output_volume = 0
                 try:
-                    # RVC 变声
-                    audio_out = engine.convert_chunk(
-                        audio_in,
-                        pitch_shift=pitch_shift,
-                        f0_method=f0_method,
-                        index_rate=index_rate,
-                        rms_mix_rate=rms_mix_rate,
-                        resample_sr=resample_sr,
-                        filter_radius=filter_radius,
-                    )
-
-                    # 确保输出长度匹配
+                    audio_out = output_q.get_nowait()
                     out_len = len(audio_out)
                     if out_len >= frames:
                         outdata[:, 0] = audio_out[:frames]
@@ -3609,12 +4584,18 @@ class HomeWindow(QMainWindow):
                         outdata[:out_len, 0] = audio_out
                         outdata[out_len:, 0] = 0.0
                     output_volume = min(int(np.sqrt(np.mean(outdata[:, 0] ** 2)) * 100), 100)
+                except queue.Empty:
+                    outdata.fill(0.0)
                 except Exception as e:
-                    print(f"RVC处理异常: {e}")
+                    print(f"RVC输出异常: {e}")
                     outdata[:] = indata  # 直通，避免完全没声音
 
                 # 无论转换成功与否都刷新音量显示（音频监控）
                 self._update_volume_display(input_volume, output_volume)
+
+            # 预填两帧静音，避免首帧无输出
+            for _ in range(2):
+                output_q.put(np.zeros(chunk_size, dtype=np.float32))
 
             # 启动音频流
             with sd.Stream(
@@ -3627,17 +4608,44 @@ class HomeWindow(QMainWindow):
                 while self._rvc_running:
                     sd.sleep(100)
 
+            conv_thread.join(timeout=1.0)
+
         except Exception as e:
             print(f"音频处理错误: {str(e)}")
             self.rvc_status_changed.emit(f"状态：音频流启动失败：{str(e)[:80]}", False)
 
     def _update_volume_display(self, input_volume: int, output_volume: int) -> None:
-        """更新音量显示（工作线程调用，经信号切回主线程）。"""
-        self.rvc_volume_updated.emit(input_volume, output_volume)
+        """更新音量显示：做快升慢降平滑并限帧，避免音量条一顿一顿。"""
+        now = time.monotonic()
+        self._smooth_in = self._approach(self._smooth_in, input_volume)
+        self._smooth_out = self._approach(self._smooth_out, output_volume)
+        if now - self._last_volume_emit < 0.06:
+            return
+        self._last_volume_emit = now
+        self.rvc_volume_updated.emit(
+            int(round(self._smooth_in)),
+            int(round(self._smooth_out)),
+        )
+
+    @staticmethod
+    def _approach(current: float, target: float) -> float:
+        """上升快、下降慢，让音量表更平滑。"""
+        if target >= current:
+            return current + (target - current) * 0.55
+        return current + (target - current) * 0.18
 
     def _on_rvc_volume_updated(self, input_volume: int, output_volume: int) -> None:
-        """在主线程中更新音量UI"""
-        self.rvc_input_volume_bar.setValue(input_volume)
-        self.rvc_input_volume_label.setText(f"{input_volume}%")
-        self.rvc_output_volume_bar.setValue(output_volume)
-        self.rvc_output_volume_label.setText(f"{output_volume}%")
+        """在主线程中更新所有音量监听表（音频页 + 首页）。"""
+        for prefix in ("rvc", "home_rvc"):
+            in_bar = getattr(self, f"{prefix}_input_volume_bar", None)
+            if in_bar is not None:
+                in_bar.setValue(input_volume)
+            in_label = getattr(self, f"{prefix}_input_volume_label", None)
+            if in_label is not None:
+                in_label.setText(f"{input_volume}%")
+            out_bar = getattr(self, f"{prefix}_output_volume_bar", None)
+            if out_bar is not None:
+                out_bar.setValue(output_volume)
+            out_label = getattr(self, f"{prefix}_output_volume_label", None)
+            if out_label is not None:
+                out_label.setText(f"{output_volume}%")

@@ -57,6 +57,98 @@ def _ascii_model_copy(source: Path) -> Path:
     return target
 
 
+def _windows_camera_names() -> list[str]:
+    """读取 Windows 上摄像头友好名称；失败时返回空列表。"""
+    if os.name != "nt":
+        return []
+    try:
+        import subprocess
+
+        result = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                "[Console]::OutputEncoding=[Text.Encoding]::UTF8; "
+                "Get-CimInstance Win32_PnPEntity -Filter "
+                "\"PNPClass='Camera' OR PNPClass='Image'\" "
+                "-ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name",
+            ],
+            capture_output=True,
+            timeout=8,
+        )
+    except Exception:
+        return []
+    text = (result.stdout or b"").decode("utf-8", errors="replace")
+    return [line.strip() for line in text.splitlines() if line.strip()]
+
+
+_CAMERA_CACHE: tuple[float, list[tuple[int, str]]] | None = None
+_CAMERA_CACHE_TTL = 60.0
+
+
+def list_camera_devices(force: bool = False, max_index: int = 6) -> list[tuple[int, str]]:
+    """探测可用摄像头，返回 [(索引, 显示名)]，索引可直接给 cv2.VideoCapture。"""
+    global _CAMERA_CACHE
+    now = time.monotonic()
+    if not force and _CAMERA_CACHE is not None and now - _CAMERA_CACHE[0] < _CAMERA_CACHE_TTL:
+        return list(_CAMERA_CACHE[1])
+
+    # 按索引探测所有能输出真实画面的摄像头，过滤掉静态占位图（如 Intel 标志）。
+    found: list[int] = []
+    for index in range(max_index):
+        if _probe_camera(index):
+            found.append(index)
+
+    names = _windows_camera_names()
+    devices: list[tuple[int, str]] = []
+    for position, index in enumerate(found):
+        label = (
+            names[position]
+            if position < len(names)
+            else f"未命名摄像头（索引 {index}）"
+        )
+        devices.append((index, label))
+    # 探测不到（驱动占用等）时退回系统设备名
+    if not devices and names:
+        for index, name in enumerate(names[:max_index]):
+            devices.append((index, name))
+    _CAMERA_CACHE = (now, devices)
+    return list(devices)
+
+
+def _probe_camera(index: int) -> bool:
+    """判断该索引是否为真实摄像头（过滤静态合成占位图）。"""
+    capture = None
+    try:
+        capture = cv2.VideoCapture(index)
+        if capture is None or not capture.isOpened():
+            return False
+        frames: list[np.ndarray] = []
+        for _ in range(3):
+            ok, frame = capture.read()
+            if ok and frame is not None:
+                frames.append(frame.astype(np.float32))
+            time.sleep(0.08)
+        if len(frames) < 2:
+            return False
+        diff = max(
+            float(np.mean(np.abs(frames[i] - frames[i - 1])))
+            for i in range(1, len(frames))
+        )
+        white_ratio = float(np.mean(frames[-1] > 235))
+        # 完全静止且大面积纯白 => Intel 等合成占位图，不是真实摄像头
+        return not (diff < 0.1 and white_ratio > 0.5)
+    except Exception:
+        return False
+    finally:
+        if capture is not None:
+            try:
+                capture.release()
+            except Exception:
+                pass
+
+
 class MotionCapture(QObject):
     """Capture webcam frames, extract motion signals, and forward them."""
 

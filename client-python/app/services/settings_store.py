@@ -45,6 +45,14 @@ DEFAULT_RVC_SETTINGS = {
     "output_device_name": "",
 }
 
+DEFAULT_SYSTEM_SETTINGS = {
+    "scheme_name": "日常直播",
+    "video_resolution": "1080P",
+    "video_fps": 60,
+    "audio_sample_rate": "48000 Hz",
+    "audio_engine": "RVC",
+}
+
 
 class SettingsStore:
     """Per-account application settings persisted under accounts_data/<account>/.
@@ -80,6 +88,19 @@ class SettingsStore:
     def save_rvc(self, rvc: dict) -> None:
         settings = self._load_all()
         settings["rvc"] = dict(DEFAULT_RVC_SETTINGS, **rvc)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(
+            json.dumps(settings, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def load_system(self) -> dict:
+        settings = self._load_all()
+        return dict(DEFAULT_SYSTEM_SETTINGS, **settings.get("system", {}))
+
+    def save_system(self, system: dict) -> None:
+        settings = self._load_all()
+        settings["system"] = dict(DEFAULT_SYSTEM_SETTINGS, **system)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(
             json.dumps(settings, ensure_ascii=False, indent=2),

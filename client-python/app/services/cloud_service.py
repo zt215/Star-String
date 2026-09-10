@@ -121,3 +121,24 @@ def upload_cloud_preset(owner: str, kind: str, name: str, content: str) -> dict:
 
 def delete_cloud_preset(preset_id: int, owner: str) -> dict:
     return _json_request("/api/cloud/presets/delete", {"id": preset_id, "owner": owner})
+
+
+def check_server(timeout: float = 5.0) -> tuple[bool, str]:
+    """探测服务器健康接口，返回 (是否在线, 状态描述)，供界面真实状态显示。"""
+    base = _base()
+    try:
+        request = urllib.request.Request(f"{base}/api/health", method="GET")
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            text = response.read().decode("utf-8")
+    except urllib.error.URLError as error:
+        return False, getattr(error, "reason", "无法连接")
+    except OSError as error:
+        return False, str(error)
+
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return True, "在线"
+    if data.get("code") == 0:
+        return True, "已连接"
+    return False, str(data.get("message", "异常响应"))
