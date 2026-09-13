@@ -15,7 +15,15 @@ from PySide6.QtCore import (
     QTimer,
     Signal,
 )
-from PySide6.QtGui import QCloseEvent, QColor, QIcon, QPainter, QPixmap, QPolygonF
+from PySide6.QtGui import (
+    QCloseEvent,
+    QColor,
+    QIcon,
+    QImage,
+    QPainter,
+    QPixmap,
+    QPolygonF,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QButtonGroup,
@@ -69,6 +77,13 @@ from app.services.model_store import (
 from app.services.rvc_service import RVCEngine, _gram_sample_length
 from app.services.motion_capture import MotionCapture, list_camera_devices
 from app.services.settings_store import SettingsStore
+from app.services.virtual_camera import (
+    VIRTUAL_CAMERA_NAME,
+    VirtualCameraError,
+    VirtualCameraOutput,
+    driver_files_present,
+    install_driver,
+)
 from app.ui.dialogs import show_info, show_warning
 from app.ui.live2d_view import Live2DView
 from app.ui.vrm_view import VRMView
@@ -610,6 +625,7 @@ class HomeWindow(QMainWindow):
     rvc_volume_updated = Signal(int, int)
     server_status_changed = Signal(bool, str)
     camera_devices_loaded = Signal(list, bool)
+    vcam_install_done = Signal(bool, str)
 
     def __init__(self, account: str | None = None, offline: bool = False) -> None:
         super().__init__()
@@ -642,6 +658,12 @@ class HomeWindow(QMainWindow):
         self._closing = False
         self._camera_devices: list = []
         self._motion_running = False
+        self._rvc_gate_threshold = 0
+        self._rvc_denoise = False
+        self.virtual_camera = VirtualCameraOutput()
+        self._stream_timer = QTimer(self)
+        self._stream_timer.setInterval(33)  # ~30 FPS
+        self._stream_timer.timeout.connect(self._push_stream_frame)
         self._smooth_in = 0.0
         self._smooth_out = 0.0
         self._last_volume_emit = 0.0
@@ -664,6 +686,7 @@ class HomeWindow(QMainWindow):
         self.rvc_volume_updated.connect(self._on_rvc_volume_updated)
         self.server_status_changed.connect(self._on_server_status_changed)
         self.camera_devices_loaded.connect(self._on_camera_devices_loaded)
+        self.vcam_install_done.connect(self._on_vcam_install_done)
         self._start_server_monitor()
         self._refresh_camera_devices()
 
@@ -672,6 +695,12 @@ class HomeWindow(QMainWindow):
         timer = getattr(self, "_server_timer", None)
         if timer is not None:
             timer.stop()
+        stream_timer = getattr(self, "_stream_timer", None)
+        if stream_timer is not None:
+            stream_timer.stop()
+        camera = getattr(self, "virtual_camera", None)
+        if camera is not None:
+            camera.stop()
         self._save_rvc_settings()
         self._save_system_settings()
         self._shutdown_live2d()
@@ -815,6 +844,7 @@ class HomeWindow(QMainWindow):
             self._refresh_camera_devices(force=False)
         if index == 2:  # RVC页面
             self._refresh_audio_devices()
+            self._refresh_rvc_model_list()
         if index == 7:
             self._refresh_cloud_models()
             self._refresh_cloud_presets()
@@ -1909,11 +1939,57 @@ class HomeWindow(QMainWindow):
         voice_box.addStretch()
         grid.addWidget(voice_card, *self.home_card_pos["rvc"])
 
-        live_card, live_box = self._make_home_card("直播互动", "live")
+        live_card, live_box = self._make_home_card("直播输出（虚拟摄像头）", "live")
         self.home_cards["live"] = live_card
-        live_hint = QLabel("弹幕 / 礼物 / 互动动作接入位")
-        live_hint.setObjectName("panelBody")
-        live_box.addWidget(live_hint)
+
+        name_row = QHBoxLayout()
+        name_row.setSpacing(8)
+        name_row.addWidget(self._form_label("设备名称"))
+        self.vcam_name_label = QLabel(VIRTUAL_CAMERA_NAME)
+        self.vcam_name_label.setObjectName("infoValue")
+        name_row.addWidget(self.vcam_name_label, 1)
+        live_box.addLayout(name_row)
+
+        video_row = QHBoxLayout()
+        video_row.setSpacing(8)
+        video_row.addWidget(self._form_label("分辨率"))
+        self.vcam_resolution_combo = ArrowComboBox()
+        self.vcam_resolution_combo.setObjectName("inputBox")
+        self.vcam_resolution_combo.addItems(["1280 x 720", "1920 x 1080"])
+        video_row.addWidget(self.vcam_resolution_combo, 1)
+        video_row.addWidget(self._form_label("帧率"))
+        self.vcam_fps_spin = ArrowSpinBox()
+        self.vcam_fps_spin.setObjectName("inputBox")
+        self.vcam_fps_spin.setRange(10, 60)
+        self.vcam_fps_spin.setValue(30)
+        video_row.addWidget(self.vcam_fps_spin, 1)
+        live_box.addLayout(video_row)
+
+        vcam_buttons = QHBoxLayout()
+        vcam_buttons.setSpacing(8)
+        self.vcam_start_button = QPushButton("启动虚拟摄像头")
+        self.vcam_start_button.setObjectName("actionButton")
+        self.vcam_start_button.clicked.connect(self._toggle_virtual_camera)
+        self.vcam_install_button = QPushButton("安装/修复驱动")
+        self.vcam_install_button.setObjectName("ghostButton")
+        self.vcam_install_button.clicked.connect(self._install_virtual_camera_driver)
+        vcam_buttons.addWidget(self.vcam_start_button)
+        vcam_buttons.addWidget(self.vcam_install_button)
+        vcam_buttons.addStretch()
+        live_box.addLayout(vcam_buttons)
+
+        self.vcam_key_toggle = QCheckBox("仅输出虚拟形象（透明背景，不带背景）")
+        self.vcam_key_toggle.setObjectName("toggle")
+        self.vcam_key_toggle.toggled.connect(self._on_vcam_key_toggled)
+        live_box.addWidget(self.vcam_key_toggle)
+
+        self.vcam_status = QLabel(
+            f"启动后，在直播伴侣的摄像头列表里选择「{VIRTUAL_CAMERA_NAME}」即可；"
+            "首次使用若列表里没有该设备，点“安装/修复驱动”。"
+        )
+        self.vcam_status.setObjectName("hintText")
+        self.vcam_status.setWordWrap(True)
+        live_box.addWidget(self.vcam_status)
         live_box.addStretch()
         grid.addWidget(live_card, *self.home_card_pos["live"])
 
@@ -2351,6 +2427,145 @@ class HomeWindow(QMainWindow):
         name = self.home_rvc_model_combo.currentText()
         if getattr(self, "home_rvc_status", None) is not None:
             self.home_rvc_status.setText(f"当前模型：{name}")
+
+    def _toggle_virtual_camera(self) -> None:
+        if self.virtual_camera.running:
+            self._stop_virtual_camera()
+            return
+        self._apply_vcam_key_background(
+            self.vcam_key_toggle.isChecked() if hasattr(self, "vcam_key_toggle") else False
+        )
+        width, height = self._selected_vcam_size()
+        self.virtual_camera.width = width
+        self.virtual_camera.height = height
+        self.virtual_camera.fps = int(self.vcam_fps_spin.value())
+        try:
+            self.virtual_camera.start()
+        except VirtualCameraError as error:
+            show_warning(
+                self,
+                "星弦",
+                f"无法启动虚拟摄像头：{error}\n"
+                "请点“安装/修复驱动”，并在系统弹窗中允许管理员权限。",
+            )
+            return
+        self._stream_timer.start()
+        self.vcam_start_button.setText("停止虚拟摄像头")
+        self.vcam_status.setText(
+            f"虚拟摄像头已启动（{self.virtual_camera.active_device}）。"
+            f"在直播伴侣中把摄像头选为「{VIRTUAL_CAMERA_NAME}」。"
+        )
+
+    def _stop_virtual_camera(self) -> None:
+        self._stream_timer.stop()
+        self.virtual_camera.stop()
+        if hasattr(self, "vcam_start_button"):
+            self.vcam_start_button.setText("启动虚拟摄像头")
+        if hasattr(self, "vcam_status"):
+            self.vcam_status.setText(
+                f"在直播伴侣中把摄像头选为「{VIRTUAL_CAMERA_NAME}」。"
+            )
+
+    def _selected_vcam_size(self) -> tuple[int, int]:
+        combo = getattr(self, "vcam_resolution_combo", None)
+        text = combo.currentText() if combo is not None else "1280 x 720"
+        if "1920" in text:
+            return 1920, 1080
+        return 1280, 720
+
+    def _apply_vcam_key_background(self, enabled: bool) -> None:
+        """把透明背景模式同步到两个模型视图（Live2D / VRM）。"""
+        for view in (
+            getattr(self, "live2d_view", None),
+            getattr(self, "avatar_vrm_view", None),
+        ):
+            if view is None:
+                continue
+            try:
+                view.set_transparent_background(enabled)
+            except Exception:
+                pass
+
+    def _on_vcam_key_toggled(self, checked: bool) -> None:
+        self._apply_vcam_key_background(checked)
+        if not hasattr(self, "vcam_status"):
+            return
+        if checked:
+            self.vcam_status.setText(
+                "已开启透明背景：虚拟摄像头只输出虚拟形象。"
+                "若直播软件支持透明通道（ARGB/Alpha）会直接显示为无背景；"
+                "不支持时会显示为黑色背景。"
+            )
+        else:
+            self.vcam_status.setText(
+                f"已关闭透明背景（输出含背景）。在直播伴侣中把摄像头选为「{VIRTUAL_CAMERA_NAME}」。"
+            )
+
+    def _install_virtual_camera_driver(self) -> None:
+        if not driver_files_present():
+            show_warning(
+                self, "星弦", "未找到虚拟摄像头驱动文件（resources/virtualcam）。"
+            )
+            return
+        self.vcam_status.setText("正在安装虚拟摄像头驱动，请在系统弹窗中允许管理员权限…")
+
+        def worker() -> None:
+            try:
+                ok, message = install_driver()
+            except Exception as error:  # noqa: BLE001
+                ok, message = False, str(error)
+            self.vcam_install_done.emit(ok, message)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_vcam_install_done(self, ok: bool, message: str) -> None:
+        if getattr(self, "_closing", False):
+            return
+        if ok:
+            self.vcam_status.setText(
+                f"{message}。现在可以点“启动虚拟摄像头”，"
+                f"并在直播伴侣里选择「{VIRTUAL_CAMERA_NAME}」。"
+            )
+        else:
+            self.vcam_status.setText("驱动安装失败。")
+            show_warning(self, "星弦", f"虚拟摄像头驱动安装失败：{message}")
+
+    def _push_stream_frame(self) -> None:
+        camera = getattr(self, "virtual_camera", None)
+        if camera is None or not camera.running:
+            return
+        kind = self._current_avatar_kind()
+        view = (
+            getattr(self, "avatar_vrm_view", None)
+            if kind == "vrm"
+            else getattr(self, "live2d_view", None)
+        )
+        if view is None or not view.isVisible():
+            return
+        try:
+            image = view.grabFramebuffer()
+        except Exception:
+            image = None
+        if image is None or image.isNull():
+            return
+        frame = self._qimage_to_rgba_array(image, camera.width, camera.height)
+        if frame is not None:
+            camera.send(frame)
+
+    @staticmethod
+    def _qimage_to_rgba_array(image: QImage, width: int, height: int):
+        if image.width() != width or image.height() != height:
+            image = image.scaled(
+                width,
+                height,
+                Qt.AspectRatioMode.IgnoreAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        rgba = image.convertToFormat(QImage.Format.Format_RGBA8888)
+        buffer = rgba.constBits()
+        array = np.frombuffer(buffer, dtype=np.uint8, count=rgba.sizeInBytes())
+        array = array.reshape((rgba.height(), rgba.bytesPerLine()))[:, : width * 4]
+        return array.reshape((height, width, 4)).copy()
 
     def _on_home_rvc_input_changed(self, index: int) -> None:
         self._sync_home_device_selection("input")
@@ -3201,6 +3416,12 @@ class HomeWindow(QMainWindow):
         )
         params_form.addWidget(self.rvc_rms_mix_rate, 3, 0, 1, 2)
 
+        # 输出阈值：低于该音量视为静音，不输出（避免底噪一直响）
+        self.rvc_gate_threshold = self._make_rvc_slider(
+            "输出阈值 (0=关闭)", 0, 100, 0, is_int=True
+        )
+        params_form.addWidget(self.rvc_gate_threshold, 4, 0, 1, 2)
+
         left_layout.addLayout(params_form)
 
         # 音高提取方法 (单选按钮组)
@@ -3257,6 +3478,10 @@ class HomeWindow(QMainWindow):
         self.rvc_is_half.setObjectName("toggle")
         self.rvc_is_half.setChecked(True)
         check_layout.addWidget(self.rvc_is_half)
+
+        self.rvc_denoise = QCheckBox("降噪")
+        self.rvc_denoise.setObjectName("toggle")
+        check_layout.addWidget(self.rvc_denoise)
         check_layout.addStretch()
         left_layout.addLayout(check_layout)
         left_layout.addStretch()
@@ -3297,7 +3522,10 @@ class HomeWindow(QMainWindow):
         setup_virtual_button.setObjectName("actionButton")
         setup_virtual_button.clicked.connect(self._setup_virtual_audio)
         right_layout.addWidget(setup_virtual_button)
-        self.rvc_audio_hint = QLabel("")
+        self.rvc_audio_hint = QLabel(
+            "回音提示：直播/通话软件里的“麦克风”请选虚拟声卡的输出端（如 CABLE Output），"
+            "不要直接选物理麦克风，否则原声和变声会同时被采集，听起来像回声。"
+        )
         self.rvc_audio_hint.setObjectName("hintText")
         self.rvc_audio_hint.setWordWrap(True)
         right_layout.addWidget(self.rvc_audio_hint)
@@ -3354,6 +3582,8 @@ class HomeWindow(QMainWindow):
         self.rvc_resample_sr.currentIndexChanged.connect(lambda _: self._save_rvc_settings())
         self.rvc_protect_voiceless.stateChanged.connect(lambda _: self._save_rvc_settings())
         self.rvc_is_half.stateChanged.connect(lambda _: self._save_rvc_settings())
+        self.rvc_gate_threshold.slider.valueChanged.connect(self._on_rvc_gate_changed)
+        self.rvc_denoise.stateChanged.connect(self._on_rvc_denoise_changed)
         self.rvc_input_device.currentIndexChanged.connect(lambda _: self._save_rvc_settings())
         self.rvc_output_device.currentIndexChanged.connect(lambda _: self._save_rvc_settings())
 
@@ -3953,6 +4183,9 @@ class HomeWindow(QMainWindow):
             self._refresh_live2d_page()
         elif kind == "vrm":
             self._refresh_vrm_page()
+        elif kind == "rvc":
+            # 导入/删除 RVC 模型后，同步刷新音频变声页与首页的模型下拉
+            self._refresh_rvc_model_list()
 
     def _refresh_vrm_page(self) -> None:
         """刷新 VRM 页面的模型列表"""
@@ -4057,9 +4290,15 @@ class HomeWindow(QMainWindow):
         self.rvc_index_rate.slider.setValue(int(rvc.get("index_rate", 75)))
         self.rvc_filter_radius.slider.setValue(int(rvc.get("filter_radius", 3)))
         self.rvc_rms_mix_rate.slider.setValue(int(rvc.get("rms_mix_rate", 25)))
+        gate = int(rvc.get("gate_threshold", 0))
+        self.rvc_gate_threshold.slider.setValue(gate)
+        self._rvc_gate_threshold = gate
 
         # 下拉框
         f0_method = rvc.get("f0_method", "rmvpe")
+        # harvest 在 CPU 实时场景过慢（转换跟不上会丢字/卡顿），自动切到更快的 rmvpe
+        if f0_method == "harvest":
+            f0_method = "rmvpe"
         idx = self.rvc_f0_method.findText(f0_method)
         if idx >= 0:
             self.rvc_f0_method.setCurrentIndex(idx)
@@ -4072,6 +4311,9 @@ class HomeWindow(QMainWindow):
         # 复选框
         self.rvc_protect_voiceless.setChecked(bool(rvc.get("protect_voiceless", True)))
         self.rvc_is_half.setChecked(bool(rvc.get("is_half", True)))
+        denoise = bool(rvc.get("denoise", False))
+        self.rvc_denoise.setChecked(denoise)
+        self._rvc_denoise = denoise
 
         # 音频设备（按名称匹配）
         input_name = rvc.get("input_device_name", "")
@@ -4102,12 +4344,22 @@ class HomeWindow(QMainWindow):
                 "resample_sr": self.rvc_resample_sr.currentText(),
                 "protect_voiceless": self.rvc_protect_voiceless.isChecked(),
                 "is_half": self.rvc_is_half.isChecked(),
+                "gate_threshold": self.rvc_gate_threshold.value(),
+                "denoise": self.rvc_denoise.isChecked(),
                 "input_device_name": input_name,
                 "output_device_name": output_name,
             }
             self.settings_store.save_rvc(rvc)
         except Exception as e:
             print(f"保存RVC设置失败: {e}")
+
+    def _on_rvc_gate_changed(self, value: int) -> None:
+        self._rvc_gate_threshold = int(value)
+        self._save_rvc_settings()
+
+    def _on_rvc_denoise_changed(self, state) -> None:
+        self._rvc_denoise = bool(state)
+        self._save_rvc_settings()
 
     def _refresh_rvc_model_list(self) -> None:
         combo = getattr(self, "rvc_model_combo", None)
@@ -4493,11 +4745,20 @@ class HomeWindow(QMainWindow):
 
             # 初始化RVC引擎
             engine = RVCEngine()
+            self._noise_floor = None
             try:
+                # CPU 上不做半精度：又慢又容易产生杂音/失真
+                use_half = bool(is_half)
+                try:
+                    import torch
+
+                    use_half = use_half and torch.cuda.is_available()
+                except Exception:
+                    use_half = False
                 engine.load_model(
                     model_path=model_path,
                     index_path=index_path,
-                    is_half=is_half,
+                    is_half=use_half,
                 )
             except Exception as e:
                 print(f"RVC模型加载失败: {e}")
@@ -4505,114 +4766,307 @@ class HomeWindow(QMainWindow):
                 return
 
             sample_rate = engine.sample_rate
-            chunk_size = _gram_sample_length(sample_rate)
+            stream_rate = self._pick_stream_rate(
+                sd, input_device_idx, output_device_idx, sample_rate
+            )
+            # 处理窗取 3 个 gram，按 50% 重叠推进（每步只输出后半段）：
+            # 短块会让 RVC 特征不稳、端部产生伪影，重叠处理后吐字明显更清楚。
+            window = _gram_sample_length(sample_rate) * 3
+            hop = max(1, window // 2)
+            chunk_size = window
+            stream_chunk = max(1, int(round(hop * stream_rate / sample_rate)))
+
+            # 预热：首次推理要加载 hubert/f0 模型并做 CUDA 初始化（可能数秒），
+            # 不预热的话启动后的第一批音频会断/杂。
+            self.rvc_status_changed.emit("状态：预热模型中…", True)
+            try:
+                warm_t = np.arange(chunk_size, dtype=np.float32) / float(sample_rate)
+                warm_audio = (0.1 * np.sin(2.0 * np.pi * 200.0 * warm_t)).astype(
+                    np.float32
+                )
+                engine.convert_chunk(
+                    warm_audio,
+                    pitch_shift=0,
+                    f0_method=f0_method,
+                    index_rate=0.0,
+                    rms_mix_rate=0.5,
+                    resample_sr=0,
+                    filter_radius=filter_radius,
+                )
+            except Exception as error:  # noqa: BLE001
+                print(f"RVC预热失败: {error}")
 
             # 通过信号在主线更新状态
             self.rvc_status_changed.emit("状态：运行中", True)
 
-            input_q: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=4)
-            output_q: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=4)
+            input_q: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=2)
+            output_q: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=2)
+
+            crossfade = max(1, int(sample_rate * 0.02))  # 20ms 输出交叉淡化
+            previous = {"tail": None}
 
             def convert_worker() -> None:
+                buffer = np.zeros(0, dtype=np.float32)
                 while self._rvc_running:
                     try:
-                        chunk = input_q.get(timeout=0.2)
+                        new_audio = input_q.get(timeout=0.2)
                     except queue.Empty:
                         continue
                     except Exception:
                         break
-                    try:
-                        audio_out = engine.convert_chunk(
-                            chunk,
-                            pitch_shift=pitch_shift,
-                            f0_method=f0_method,
-                            index_rate=index_rate,
-                            rms_mix_rate=rms_mix_rate,
-                            resample_sr=resample_sr,
-                            filter_radius=filter_radius,
-                        )
-                    except Exception as e:
-                        print(f"RVC处理异常: {e}")
-                        audio_out = chunk
-                    try:
-                        output_q.get_nowait()  # 丢弃最旧，保证实时
-                    except queue.Empty:
-                        pass
-                    try:
-                        output_q.put_nowait(audio_out)
-                    except queue.Full:
-                        pass
+                    buffer = (
+                        np.concatenate([buffer, new_audio])
+                        if buffer.size
+                        else np.asarray(new_audio, dtype=np.float32)
+                    )
+                    while buffer.size >= window and self._rvc_running:
+                        segment = buffer[:window].copy()
+                        buffer = buffer[hop:]
+                        try:
+                            if getattr(self, "_rvc_denoise", False):
+                                segment = self._denoise_audio(segment)
+                            audio_out = engine.convert_chunk(
+                                segment,
+                                pitch_shift=pitch_shift,
+                                f0_method=f0_method,
+                                index_rate=index_rate,
+                                rms_mix_rate=rms_mix_rate,
+                                # 实时链路固定按模型采样率输出，交给输出流统一重采样，
+                                # 否则返回的采样率与播放采样率不一致会造成变调/卡顿。
+                                resample_sr=0,
+                                filter_radius=filter_radius,
+                            )
+                        except Exception as e:
+                            print(f"RVC处理异常: {e}")
+                            audio_out = segment
+                        audio_out = np.asarray(audio_out, dtype=np.float32)
+                        # 取后半段输出（前一半是重叠区，端部伪影不进结果）
+                        if len(audio_out) >= hop * 2:
+                            piece = audio_out[hop : hop * 2].copy()
+                        else:
+                            piece = audio_out[hop:].copy()
+                        if piece.size == 0:
+                            continue
+                        tail = previous.get("tail")
+                        if tail is not None and len(piece) > crossfade:
+                            fade = np.linspace(0.0, 1.0, crossfade, dtype=np.float32)
+                            piece[:crossfade] = (
+                                piece[:crossfade] * fade + tail * (1.0 - fade)
+                            )
+                        if len(piece) >= crossfade:
+                            previous["tail"] = piece[-crossfade:].copy()
+                        try:
+                            output_q.get_nowait()  # 丢弃最旧，保证实时
+                        except queue.Empty:
+                            pass
+                        try:
+                            output_q.put_nowait(piece)
+                        except queue.Full:
+                            pass
 
             conv_thread = threading.Thread(target=convert_worker, daemon=True)
             conv_thread.start()
 
-            def audio_callback(indata, outdata, frames, time_info, status):
-                if status:
-                    print(f"音频状态: {status}")
+            volumes = {"in": 0, "out": 0, "speaking": True}
+            gate = {"gain": 1.0, "target": 1.0}
 
-                if not self._rvc_running:
-                    return
-
+            def push_input(audio: np.ndarray) -> None:
                 try:
-                    # 输入音频转为 float32 mono
-                    audio_in = indata[:, 0].copy().astype(np.float32)
-                    input_volume = min(int(np.sqrt(np.mean(audio_in ** 2)) * 100), 100)
-                except Exception:
-                    audio_in = indata[:, 0].copy().astype(np.float32)
-                    input_volume = 0
-
-                # 送入转换队列（满则丢弃最旧，保证实时）
-                try:
-                    input_q.put_nowait(audio_in)
+                    input_q.put_nowait(audio)
                 except queue.Full:
                     try:
                         input_q.get_nowait()
                     except queue.Empty:
                         pass
                     try:
-                        input_q.put_nowait(audio_in)
+                        input_q.put_nowait(audio)
                     except queue.Full:
                         pass
 
-                output_volume = 0
+            def input_callback(indata, frames, time_info, status):
+                if status:
+                    print(f"音频输入状态: {status}")
+                if not self._rvc_running:
+                    return
+                audio_in = indata[:, 0].copy().astype(np.float32)
+                try:
+                    volumes["in"] = min(int(np.sqrt(np.mean(audio_in ** 2)) * 100), 100)
+                except Exception:
+                    volumes["in"] = 0
+                threshold = int(getattr(self, "_rvc_gate_threshold", 0) or 0)
+                if threshold <= 0 or volumes["in"] >= threshold:
+                    gate["target"] = 1.0
+                    speaking = True
+                elif gate["gain"] > 0.01:
+                    # 正在释放尾音：继续送入，保证平滑收尾
+                    gate["target"] = 0.0
+                    speaking = True
+                else:
+                    gate["target"] = 0.0
+                    speaking = False
+                volumes["speaking"] = speaking
+                if speaking:
+                    push_input(
+                        self._resample_audio(audio_in, stream_rate, sample_rate)
+                    )
+                self._update_volume_display(volumes["in"], volumes["out"])
+
+            def output_callback(outdata, frames, time_info, status):
+                if status:
+                    print(f"音频输出状态: {status}")
+                if not self._rvc_running:
+                    outdata.fill(0.0)
+                    return
                 try:
                     audio_out = output_q.get_nowait()
-                    out_len = len(audio_out)
-                    if out_len >= frames:
-                        outdata[:, 0] = audio_out[:frames]
-                    else:
-                        outdata[:out_len, 0] = audio_out
-                        outdata[out_len:, 0] = 0.0
-                    output_volume = min(int(np.sqrt(np.mean(outdata[:, 0] ** 2)) * 100), 100)
                 except queue.Empty:
                     outdata.fill(0.0)
-                except Exception as e:
-                    print(f"RVC输出异常: {e}")
-                    outdata[:] = indata  # 直通，避免完全没声音
+                    volumes["out"] = 0
+                    self._update_volume_display(volumes["in"], volumes["out"])
+                    return
+                audio_out = self._resample_audio(audio_out, sample_rate, stream_rate)
+                out_len = len(audio_out)
+                # 平滑门限增益：快开慢关，逐样本渐变，避免断续和咔哒声
+                gain0 = gate["gain"]
+                target = gate["target"]
+                step = 0.45 if target > gain0 else 0.15
+                gain1 = gain0 + (target - gain0) * step
+                ramp = np.linspace(gain0, gain1, frames, dtype=np.float32)
+                if out_len >= frames:
+                    outdata[:, 0] = audio_out[:frames] * ramp
+                else:
+                    outdata[:out_len, 0] = audio_out * ramp[:out_len]
+                    outdata[out_len:, 0] = 0.0
+                gate["gain"] = gain1
+                try:
+                    volumes["out"] = min(int(np.sqrt(np.mean(outdata[:, 0] ** 2)) * 100), 100)
+                except Exception:
+                    volumes["out"] = 0
+                self._update_volume_display(volumes["in"], volumes["out"])
 
-                # 无论转换成功与否都刷新音量显示（音频监控）
-                self._update_volume_display(input_volume, output_volume)
+            # 只填 1 帧静音：缓冲越少延迟/回音越短
+            for _ in range(1):
+                output_q.put(np.zeros(hop, dtype=np.float32))
 
-            # 预填两帧静音，避免首帧无输出
-            for _ in range(2):
-                output_q.put(np.zeros(chunk_size, dtype=np.float32))
-
-            # 启动音频流
-            with sd.Stream(
-                device=(input_device_idx, output_device_idx),
+            # 输入/输出分开建流：避免不同设备无法组成全双工流（PaErrorCode -9993）
+            input_stream = sd.InputStream(
+                device=input_device_idx,
                 channels=1,
-                samplerate=sample_rate,
-                blocksize=chunk_size,
-                callback=audio_callback,
-            ):
+                samplerate=stream_rate,
+                blocksize=stream_chunk,
+                dtype="float32",
+                callback=input_callback,
+            )
+            output_stream = sd.OutputStream(
+                device=output_device_idx,
+                channels=1,
+                samplerate=stream_rate,
+                blocksize=stream_chunk,
+                dtype="float32",
+                callback=output_callback,
+            )
+            input_stream.start()
+            output_stream.start()
+            try:
                 while self._rvc_running:
                     sd.sleep(100)
+            finally:
+                for stream in (input_stream, output_stream):
+                    try:
+                        stream.stop()
+                        stream.close()
+                    except Exception:
+                        pass
 
             conv_thread.join(timeout=1.0)
 
         except Exception as e:
             print(f"音频处理错误: {str(e)}")
             self.rvc_status_changed.emit(f"状态：音频流启动失败：{str(e)[:80]}", False)
+
+    @staticmethod
+    def _pick_stream_rate(sd, input_device_idx, output_device_idx, preferred: int) -> int:
+        """选择输入/输出设备都支持的采样率，避免采样率不匹配导致建流失败。"""
+        candidates: list[int] = []
+        # 优先设备原生采样率（48k/44.1k），由本程序做高质量重采样；
+        # 直接用非标采样率（如 40000）时部分后端会做低质量重采样，导致发闷/杂音。
+        for rate in (48000, 44100, preferred):
+            if rate and int(rate) not in candidates:
+                candidates.append(int(rate))
+        for rate in candidates:
+            try:
+                sd.check_input_settings(
+                    device=input_device_idx,
+                    channels=1,
+                    samplerate=rate,
+                    dtype="float32",
+                )
+                sd.check_output_settings(
+                    device=output_device_idx,
+                    channels=1,
+                    samplerate=rate,
+                    dtype="float32",
+                )
+                return rate
+            except Exception:
+                continue
+        try:
+            info = sd.query_devices(input_device_idx)
+            default_rate = int(info.get("default_samplerate") or preferred)
+            if default_rate:
+                return default_rate
+        except Exception:
+            pass
+        return int(preferred)
+
+    @staticmethod
+    def _resample_audio(audio: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:
+        """在音频流采样率与模型采样率之间转换。"""
+        if src_rate == dst_rate or audio.size == 0:
+            return audio
+        try:
+            from math import gcd
+            from scipy.signal import resample_poly
+
+            divisor = gcd(int(src_rate), int(dst_rate))
+            return resample_poly(
+                audio,
+                int(dst_rate) // divisor,
+                int(src_rate) // divisor,
+            ).astype(np.float32)
+        except Exception:
+            return audio
+
+    def _denoise_audio(self, audio: np.ndarray) -> np.ndarray:
+        """轻量谱减降噪：抑制较稳定的背景底噪（如风扇、电流声）。"""
+        try:
+            from scipy.signal import istft, stft
+        except Exception:
+            return audio
+        try:
+            nperseg = 256
+            noverlap = nperseg * 3 // 4
+            _, _, spec = stft(audio, nperseg=nperseg, noverlap=noverlap)
+            magnitude = np.abs(spec)
+            current = magnitude.mean(axis=1, keepdims=True)
+            floor = getattr(self, "_noise_floor", None)
+            if floor is None or getattr(floor, "shape", None) != current.shape:
+                floor = current
+            else:
+                # 只在安静帧更新底噪，避免把说话声当成噪声
+                quiet = current < (floor * 2.0 + 1e-6)
+                floor = np.where(quiet, 0.9 * floor + 0.1 * current, floor)
+            self._noise_floor = floor
+            # 保守掩码：最多衰减到 20%，避免把语音也一起削掉导致听不清
+            reduced = np.maximum(magnitude - floor, 0.0)
+            mask = np.clip(reduced / (magnitude + 1e-9), 0.2, 1.0)
+            _, cleaned = istft(spec * mask, nperseg=nperseg, noverlap=noverlap)
+            cleaned = np.asarray(cleaned, dtype=np.float32)[: len(audio)]
+            if len(cleaned) < len(audio):
+                cleaned = np.pad(cleaned, (0, len(audio) - len(cleaned)))
+            return cleaned
+        except Exception:
+            return audio
 
     def _update_volume_display(self, input_volume: int, output_volume: int) -> None:
         """更新音量显示：做快升慢降平滑并限帧，避免音量条一顿一顿。"""

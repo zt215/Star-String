@@ -105,8 +105,13 @@ class VRMRenderer:
         self._camera_dist = 2.6
         self._ready = False
         self._white_tex = 0
+        self._background = (0.06, 0.08, 0.14, 1.0)
         # location cache
         self._loc = {}
+
+    def set_background(self, r: float, g: float, b: float, a: float = 1.0) -> None:
+        """设置清屏背景色（默认深色；纯绿用于直播抠像）。"""
+        self._background = (float(r), float(g), float(b), float(a))
 
     # The PyOpenGL wrapper for glGenTextures is broken in some builds, so use
     # the raw function to create/delete texture names.
@@ -380,7 +385,7 @@ class VRMRenderer:
         GL.glEnable(GL.GL_BLEND)
         GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA)
         GL.glDisable(GL.GL_CULL_FACE)
-        GL.glClearColor(0.06, 0.08, 0.14, 1.0)
+        GL.glClearColor(*self._background)
         GL.glClear(GL.GL_COLOR_BUFFER_BIT | GL.GL_DEPTH_BUFFER_BIT)
 
         proj_view = self._view_proj()

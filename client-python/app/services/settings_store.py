@@ -41,6 +41,8 @@ DEFAULT_RVC_SETTINGS = {
     "resample_sr": "0",
     "protect_voiceless": True,
     "is_half": True,
+    "gate_threshold": 0,
+    "denoise": False,
     "input_device_name": "",
     "output_device_name": "",
 }

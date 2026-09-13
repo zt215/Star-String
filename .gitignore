@@ -2,7 +2,9 @@
 材料/
 client-python/models/
 client-python/docs/
-client-python/app/resources/
+client-python/app/resources/*
+!client-python/app/resources/virtualcam/
+!client-python/app/resources/virtualcam/**
 tools/
 *.ico
 *.png

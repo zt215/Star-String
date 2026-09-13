@@ -51,6 +51,12 @@ class Live2DView(QOpenGLWidget, ModelViewInterface):
         self._warned_missing: set[str] = set()
         self._signals = ModelViewSignals()
         self._params: dict[str, ModelParam] = {}
+        self._key_background = False
+
+    def set_transparent_background(self, enabled: bool) -> None:
+        """开启后使用透明背景，虚拟摄像头可直接输出带 Alpha 的画面。"""
+        self._key_background = bool(enabled)
+        self.update()
 
     # ---- ModelViewInterface 实现 ----
 
@@ -299,8 +305,11 @@ class Live2DView(QOpenGLWidget, ModelViewInterface):
     def paintGL(self) -> None:
         if not _LIVE2D_AVAILABLE:
             return
-        # Clear to the panel navy so the view blends with cards (no black/transparent artefact).
-        live2d.clearBuffer(0.04, 0.08, 0.16, 1.0)
+        if self._key_background:
+            live2d.clearBuffer(0.0, 0.0, 0.0, 0.0)
+        else:
+            # Clear to the panel navy so the view blends with cards.
+            live2d.clearBuffer(0.04, 0.08, 0.16, 1.0)
         if self._model is not None:
             try:
                 self._model.Update()

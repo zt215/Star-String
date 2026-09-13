@@ -48,6 +48,7 @@ class VRMView(QOpenGLWidget, ModelViewInterface):
         self._params: dict[str, ModelParam] = {}
         self._morph: dict[str, float] = {}
         self._drive: dict[str, float] = {}
+        self._key_background = False
 
         # 动画计时
         self._timer = QTimer(self)
@@ -57,6 +58,11 @@ class VRMView(QOpenGLWidget, ModelViewInterface):
         super().showEvent(event)
         if not self._timer.isActive():
             self._timer.start(33)  # ~30 FPS
+
+    def set_transparent_background(self, enabled: bool) -> None:
+        """开启后使用透明背景，虚拟摄像头可直接输出带 Alpha 的画面。"""
+        self._key_background = bool(enabled)
+        self.update()
 
     def hideEvent(self, event) -> None:
         self._timer.stop()
@@ -240,13 +246,20 @@ class VRMView(QOpenGLWidget, ModelViewInterface):
             try:
                 if self._rig is not None:
                     self._rig.update()
+                self._renderer.set_background(
+                    *( (0.0, 0.0, 0.0, 0.0) if self._key_background
+                       else (0.06, 0.08, 0.14, 1.0) )
+                )
                 self._renderer.render()
                 return
             except Exception:
                 traceback.print_exc()
                 self._renderer = None
         # 渲染器不可用时的降级背景
-        glClearColor(0.06, 0.08, 0.14, 1.0)
+        if self._key_background:
+            glClearColor(0.0, 0.0, 0.0, 0.0)
+        else:
+            glClearColor(0.06, 0.08, 0.14, 1.0)
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
 
     # ---- 信号访问 ----

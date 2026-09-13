@@ -4,7 +4,7 @@ import os
 import sys
 
 from PySide6.QtCore import QTimer
-from PySide6.QtGui import QColor, QPalette
+from PySide6.QtGui import QColor, QPalette, QSurfaceFormat
 from PySide6.QtWidgets import QApplication
 
 from app.services.account_store import AccountStore
@@ -34,6 +34,13 @@ def _apply_dark_palette(app: QApplication) -> None:
 
 
 def main() -> int:
+    # 虚拟摄像头透明背景需要 OpenGL 表面带 alpha 通道，必须在创建窗口前设置。
+    surface_format = QSurfaceFormat()
+    surface_format.setAlphaBufferSize(8)
+    surface_format.setDepthBufferSize(24)
+    surface_format.setStencilBufferSize(8)
+    QSurfaceFormat.setDefaultFormat(surface_format)
+
     app = QApplication(sys.argv)
     app.setApplicationName("星弦")
     app.setStyle("Fusion")

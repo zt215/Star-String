@@ -579,22 +579,20 @@ def voice_conversion(
         ).astype(np.float32)
     f0 = _align_f0_to_feats(f0, p_len)
 
-    # Build pitch tensors
-    pitch = f0.copy()
-    pitch[pitch > 0] = _hz_to_bin(pitch[pitch > 0], model.sample_rate)
-    pitch = pitch.astype(np.int64).reshape(1, -1)
-    f0 = f0.reshape(1, -1).astype(np.float32)
-
-    # Apply pitch shift
-    pitch = pitch.copy()
+    # Build pitch tensors：先按半音移调 f0(Hz)，再重新分箱（RVC 官方做法）
     f0_shifted = f0.copy()
     if pitch_shift != 0:
-        pitch += pitch_shift
-        f0_shifted *= 2 ** (pitch_shift / 12)
+        voiced = f0_shifted > 0
+        f0_shifted[voiced] = f0_shifted[voiced] * (2.0 ** (pitch_shift / 12.0))
+    pitch = np.zeros_like(f0_shifted, dtype=np.int64)
+    voiced = f0_shifted > 0
+    pitch[voiced] = _hz_to_bin(f0_shifted[voiced], model.sample_rate)
+    pitch = pitch.reshape(1, -1)
+    f0_tensor = f0_shifted.reshape(1, -1).astype(np.float32)
 
     # Voice conversion
     audio_out = model.convert(
-        feats, pitch, f0_shifted, pitch_shift=0, return_length2=len(audio)
+        feats, pitch, f0_tensor, pitch_shift=0, return_length2=len(audio)
     )
 
     # RMS matching
@@ -630,11 +628,20 @@ def _align_f0_to_feats(f0: np.ndarray, n_feats: int) -> np.ndarray:
 
 
 def _hz_to_bin(hz: np.ndarray, sample_rate: int, n_bins: int = 256) -> np.ndarray:
-    """Convert Hz to pitch bin index."""
+    """Convert Hz to RVC pitch bin index.
+
+    RVC 使用梅尔刻度分箱（见官方 f0_to_coarse），不是简单的对数分箱；
+    用错映射会让模型收到完全错误的音高条件，导致吐字不清、音色糊。
+    """
     f_min = 50.0
     f_max = 1100.0
+    f_mel_min = 1127.0 * np.log(1.0 + f_min / 700.0)
+    f_mel_max = 1127.0 * np.log(1.0 + f_max / 700.0)
     hz = np.clip(hz, f_min, f_max)
-    return np.round(n_bins * (np.log(hz / f_min) / np.log(f_max / f_min))).astype(np.int64)
+    mel = 1127.0 * np.log(1.0 + hz / 700.0)
+    mel = (mel - f_mel_min) * (n_bins - 2) / (f_mel_max - f_mel_min) + 1.0
+    mel = np.clip(mel, 1, n_bins - 1)
+    return np.round(mel).astype(np.int64)
 
 
 # ---------------------------------------------------------------------------
