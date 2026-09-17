@@ -77,6 +77,23 @@ class ModelViewInterface:
         """播放动作"""
         raise NotImplementedError
 
+    def available_actions(self) -> list[tuple[str, str]]:
+        """当前模型真正支持的动作 / 表情，``[(动作 id, 菜单显示名), ...]``。
+
+        手势菜单的可选项由它生成——写死的固定列表对不上模型，用户选了一个
+        模型根本没有的东西自然「选完没用」。具体实现见
+        :mod:`app.services.model_actions`。
+        """
+        return []
+
+    def set_expression(self, name: str) -> bool:
+        """按模型自己的表情名设置表情，成功返回 ``True``。"""
+        return False
+
+    def clear_expression(self) -> None:
+        """清除由 ``set_expression`` 设置的表情。"""
+        return None
+
 
 class ModelViewSignals(QObject):
     """模型视图的信号定义"""

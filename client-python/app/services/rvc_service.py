@@ -38,11 +38,11 @@ def _default_device() -> str:
 
 
 def _gram_sample_length(model_sr: int) -> int:
-    """Return the number of samples per gram for a given sample rate."""
+    """Return the number of samples per gram (10ms) for a given sample rate."""
     if model_sr in (32000,):
         return 3200
-    if model_sr in (40000, 48000):
-        return 4800
+    if model_sr in (40000,):
+        return 4000
     return 4800
 
 
@@ -75,6 +75,56 @@ class HarvestF0:
         if filter_radius > 0:
             f0 = self._median_filter(f0, filter_radius)
         return f0.astype(np.float32)
+
+    @staticmethod
+    def _median_filter(data: np.ndarray, kernel_size: int) -> np.ndarray:
+        if kernel_size <= 1:
+            return data
+        pad = kernel_size // 2
+        padded = np.pad(data, (pad, pad), mode="edge")
+        result = np.empty_like(data)
+        for i in range(len(data)):
+            result[i] = np.median(padded[i : i + kernel_size])
+        return result
+
+
+class PitchMarkF0:
+    """Pitch extraction using Praat's autocorrelation (pm) method.
+
+    与官方 RVC 的 ``pm`` 后端一致（parselmouth ``to_pitch_ac``），速度远快于
+    harvest，适合实时链路。
+    """
+
+    def __init__(self) -> None:
+        self._parselmouth = None
+
+    def _ensure_parselmouth(self):
+        if self._parselmouth is None:
+            try:
+                import parselmouth
+                self._parselmouth = parselmouth
+            except ImportError:
+                raise ImportError(
+                    "praat-parselmouth is required for pm F0 extraction.\n"
+                    "Install it: pip install praat-parselmouth"
+                )
+        return self._parselmouth
+
+    def extract(self, audio: np.ndarray, sample_rate: int, filter_radius: int = 3) -> np.ndarray:
+        parselmouth = self._ensure_parselmouth()
+        f0 = (
+            parselmouth.Sound(audio.astype(np.float64), sample_rate)
+            .to_pitch_ac(
+                time_step=0.01,
+                voicing_threshold=0.6,
+                pitch_floor=50,
+                pitch_ceiling=1100,
+            )
+            .selected_array["frequency"]
+        )
+        if filter_radius > 0:
+            f0 = self._median_filter(f0, filter_radius)
+        return np.asarray(f0, dtype=np.float32)
 
     @staticmethod
     def _median_filter(data: np.ndarray, kernel_size: int) -> np.ndarray:
@@ -201,13 +251,47 @@ class HubertFeatureExtractor:
 
         from transformers import HubertModel, Wav2Vec2FeatureExtractor
 
-        model_path = self.model_path
-        if model_path is None or not Path(model_path).exists():
-            model_path = "facebook/hubert-base-ls960"
+        # 默认优先使用官方 RVC 的 ContentVec（transformers 格式 hubert_base 目录）。
+        # facebook/hubert-base-ls960 与 RVC 训练所用的 ContentVec 特征分布不同，
+        # 直接套用会让下游合成器收到"错误的语音内容"，产生含混/怪声。
+        candidates = []
+        if self.model_path:
+            candidates.append(self.model_path)
+        candidates.append(str(Path(__file__).resolve().parents[2] / "assets" / "hubert_base"))
+        candidates.append("facebook/hubert-base-ls960")
+        model_path = next(
+            (c for c in candidates if Path(c).exists() and (Path(c) / "config.json").exists()),
+            candidates[-1],
+        )
 
         logger.info("Loading Hubert model from %s", model_path)
-        self._feat_extractor = Wav2Vec2FeatureExtractor.from_pretrained(model_path)
-        self._model = HubertModel.from_pretrained(model_path).to(self.device)
+        # 优先本地缓存：联网不可达时 from_pretrained 会反复重试，把变声启动
+        # 拖长几十秒；本地命中则完全不碰网络。
+        # 加载期间提升 transformers 日志级别：ContentVec 权重里的 final_proj
+        # 是训练头，推理用不到，LOAD REPORT 的 UNEXPECTED 提示无害但会刷屏。
+        import logging as _logging
+
+        _hf_logger = _logging.getLogger("transformers.modeling_utils")
+        _prev_level = _hf_logger.level
+        _hf_logger.setLevel(_logging.ERROR)
+        try:
+            try:
+                self._feat_extractor = Wav2Vec2FeatureExtractor.from_pretrained(
+                    model_path, local_files_only=True
+                )
+                self._model = HubertModel.from_pretrained(
+                    model_path, local_files_only=True
+                ).to(self.device)
+            except Exception:
+                _hf_logger.setLevel(_prev_level)
+                self._feat_extractor = Wav2Vec2FeatureExtractor.from_pretrained(model_path)
+                self._model = HubertModel.from_pretrained(model_path).to(self.device)
+                logger.warning("Hubert 本地加载失败，已联网重试")
+        finally:
+            _hf_logger.setLevel(_prev_level)
+        # 官方 ContentVec 权重以 fp16 存储；先统一转 fp32，再按 is_half 决定精度，
+        # 避免 fp16 权重 + fp32 输入在卷积层报 dtype 不匹配。
+        self._model = self._model.float().to(self.device)
         self._model.eval()
         if self.is_half:
             self._model.half()
@@ -353,24 +437,6 @@ class RVCModel:
         pitch_shift: int = 0,
         return_length2: int | None = None,
     ) -> np.ndarray:
-        """Run voice conversion on extracted features.
-
-        Parameters
-        ----------
-        feats : np.ndarray
-            Hubert features (D, T).
-        pitch : np.ndarray or None
-            Pitch bin indices (1, 1, T).
-        pitchf : np.ndarray or None
-            Continuous pitch in Hz (1, 1, T).
-        pitch_shift : int
-            Pitch shift in semitones.
-
-        Returns
-        -------
-        np.ndarray
-            Converted audio waveform (1, T_out).
-        """
         import torch
 
         with torch.inference_mode():
@@ -402,6 +468,32 @@ class RVCModel:
             output = self.net.infer(feats_t, p_len, pitch2, pitchf, sid)
             audio = output[0][0, 0].cpu().float().numpy()
             return audio
+
+    def convert_padded(
+        self,
+        feats: np.ndarray,
+        pitch: np.ndarray | None,
+        pitchf: np.ndarray | None,
+        pad_frames: int = 0,
+        out_len: int | None = None,
+    ) -> np.ndarray:
+        """推理后裁掉首尾 padding 帧，并把有效段对齐到 out_len 个采样点。
+
+        官方管线在推理前对音频做 0.1s 反射 pad，推理后按目标采样率裁掉同样的
+        长度（``[t_pad_tgt:-t_pad_tgt]``），避免块边界处的塌陷伪影。
+        """
+        audio = self.convert(feats, pitch, pitchf)
+        upp = max(1, int(self.sample_rate // 100))  # 每帧样本数（100 fps）
+        strip = int(pad_frames) * upp
+        if strip > 0 and len(audio) > 2 * strip:
+            audio = audio[strip:-strip]
+        if out_len and len(audio) > 0 and len(audio) != out_len:
+            audio = np.interp(
+                np.linspace(0.0, 1.0, out_len),
+                np.linspace(0.0, 1.0, len(audio)),
+                audio,
+            ).astype(np.float32)
+        return audio
 
 
 def _try_import_synthesizer(config, sample_rate, is_half):
@@ -493,6 +585,27 @@ def change_speed(audio: np.ndarray, speed: float) -> np.ndarray:
     return librosa.resample(audio, orig_sr=48000, target_sr=int(48000 * speed))
 
 
+_F0_BACKEND_MODULES = {
+    "harvest": "pyworld",
+    "crepe": "crepe",
+    "rmvpe": "rmvpe",
+    "pm": "parselmouth",
+    "praat": "parselmouth",
+}
+
+
+def f0_method_available(method: str) -> bool:
+    """判断某个基频提取后端在当前环境是否可用（依赖是否已安装）。"""
+    import importlib.util
+    module = _F0_BACKEND_MODULES.get(method)
+    if module is None:
+        return False
+    try:
+        return importlib.util.find_spec(module) is not None
+    except Exception:
+        return False
+
+
 def get_f0(
     audio: np.ndarray,
     sample_rate: int,
@@ -510,7 +623,7 @@ def get_f0(
     sample_rate : int
         Audio sample rate.
     method : str
-        One of: 'harvest', 'crepe', 'rmvpe'.
+        One of: 'pm', 'harvest', 'crepe', 'rmvpe'.
     filter_radius : int
         Median filter radius for smoothing.
     model_path : str or None
@@ -523,6 +636,7 @@ def get_f0(
     np.ndarray
         F0 values in Hz, one per frame.
     """
+    logger.info("F0 backend selected: %s", method)
     try:
         if method == "harvest":
             return HarvestF0().extract(audio, sample_rate, filter_radius)
@@ -530,8 +644,15 @@ def get_f0(
             return CrepeF0().extract(audio, sample_rate, filter_radius)
         elif method == "rmvpe":
             return RMVPF0(model_path).extract(audio, sample_rate, device)
+        elif method in ("pm", "praat"):
+            return PitchMarkF0().extract(audio, sample_rate, filter_radius)
+    except Exception as e:
+        logger.warning("F0 method %r unavailable (%s); falling back to pm", method, e)
+    # 回退顺序：rmvpe/crepe/harvest 都可能因依赖缺失或太慢不可用，
+    # 统一落到官方同款 pm（parselmouth），保证实时链路不超时。
+    try:
+        return PitchMarkF0().extract(audio, sample_rate, filter_radius)
     except Exception:
-        # 所选音高提取后端不可用时回退到 harvest（pyworld），保证至少能变声
         pass
     return HarvestF0().extract(audio, sample_rate, filter_radius)
 
@@ -561,60 +682,88 @@ def voice_conversion(
     if hubert is None:
         hubert = HubertFeatureExtractor(device=model.device, is_half=model.is_half)
 
-    # Extract hubert features
-    feats = hubert.extract(audio, sample_rate, index=index, index_rate=index_rate)
+    import librosa
+    from scipy import signal as _signal
 
-    # Extract f0
-    f0 = get_f0(audio, sample_rate, f0_method, filter_radius, f0_model_path, model.device)
+    # --- 对齐官方 infer_rvc_full 管线：所有特征在 16k 上提取 ---
+    # 1) 48Hz 高通：去除低频隆隆，避免污染 hubert 特征与基频跟踪
+    # 2) 16k 降采样：hubert/RMVPE/PM 的官方工作采样率
+    sr = 16000
+    if sample_rate != sr:
+        audio16 = librosa.resample(audio, orig_sr=sample_rate, target_sr=sr)
+    else:
+        audio16 = audio.copy()
+    try:
+        bh, ah = _signal.butter(N=5, Wn=48, btype="high", fs=sr)
+        audio16 = _signal.filtfilt(bh, ah, audio16.astype(np.float64)).astype(np.float32)
+    except Exception:
+        pass
 
-    # 模型期望的特征帧数（约 100 帧/秒），把特征和 f0 对齐到这个长度
-    t = feats.shape[1]
-    p_len = max(int(round(audio.shape[0] / model.sample_rate * 100)), t)
-    if t != p_len:
-        x_old = np.linspace(0.0, 1.0, t)
-        x_new = np.linspace(0.0, 1.0, p_len)
-        feats = np.stack(
-            [np.interp(x_new, x_old, feats[c]) for c in range(feats.shape[0])],
-            axis=0,
-        ).astype(np.float32)
+    # 3) 块边界反射 padding：官方在前后各 pad 0.1s（window=160 帧的 10 倍），
+    #    使首尾帧不至于塌陷。实时链路每个块单独推理时这一步尤其关键。
+    pad_samples = sr // 10  # 0.1s
+    audio_padded = np.pad(audio16, (pad_samples, pad_samples), mode="reflect")
+
+    # --- 特征提取（50 fps）---
+    feats = hubert.extract(audio_padded, sr, index=index, index_rate=index_rate)
+
+    # --- 基频提取（官方在 padded 16k 上做）---
+    f0 = get_f0(audio_padded, sr, f0_method, filter_radius, f0_model_path, model.device)
+
+    # --- 关键修复：清音段(uv)基频桥接 ---
+    # 官方在分箱/送入 NSF 声码器前，把所有 f0==0 的帧用邻近浊音值线性插值填充。
+    # 否则 NSF 在清音段激励被置零灌噪声，辅音/气声全部糊掉 —— 这就是"吐字不清"的根因。
+    f0 = np.asarray(f0, dtype=np.float32).reshape(-1)
+    uv = f0 <= 0
+    if uv.any() and (~uv).sum() >= 2:
+        idx_voiced = np.where(~uv)[0]
+        f0[uv] = np.interp(np.where(uv)[0], idx_voiced, f0[idx_voiced])
+    elif uv.all():
+        f0 = np.zeros_like(f0)
+
+    # --- 帧率对齐：hubert 50fps -> 官方 x2 上采样到 100fps（=sr/160 帧）---
+    t_hub = feats.shape[1]
+    p_len = audio_padded.shape[0] // 160
+    if p_len <= 0:
+        p_len = t_hub * 2
+    x_old = np.linspace(0.0, 1.0, t_hub)
+    x_new = np.linspace(0.0, 1.0, p_len)
+    feats = np.stack(
+        [np.interp(x_new, x_old, feats[c]) for c in range(feats.shape[0])], axis=0
+    ).astype(np.float32)
     f0 = _align_f0_to_feats(f0, p_len)
 
-    # Build pitch tensors：先按半音移调 f0(Hz)，再重新分箱（RVC 官方做法）
+    # --- 音高张量：先半音移调（连续 Hz），再按官方梅尔刻度分箱 ---
     f0_shifted = f0.copy()
     if pitch_shift != 0:
-        voiced = f0_shifted > 0
-        f0_shifted[voiced] = f0_shifted[voiced] * (2.0 ** (pitch_shift / 12.0))
-    pitch = np.zeros_like(f0_shifted, dtype=np.int64)
+        f0_shifted = f0_shifted * (2.0 ** (pitch_shift / 12.0))
+    pitch = np.zeros(p_len, dtype=np.int64)
     voiced = f0_shifted > 0
-    pitch[voiced] = _hz_to_bin(f0_shifted[voiced], model.sample_rate)
+    pitch[voiced] = _hz_to_bin(f0_shifted[voiced], sr)
     pitch = pitch.reshape(1, -1)
     f0_tensor = f0_shifted.reshape(1, -1).astype(np.float32)
 
-    # Voice conversion
-    audio_out = model.convert(
-        feats, pitch, f0_tensor, pitch_shift=0, return_length2=len(audio)
+    # --- 推理 ---
+    # 输出样本数换算：输出在模型采样率上，按输入长度等比例换算
+    out_len_target = int(round(len(audio) * model.sample_rate / sample_rate))
+    audio_out = model.convert_padded(
+        feats, pitch, f0_tensor, pad_frames=pad_samples // 160, out_len=out_len_target
     )
 
-    # RMS matching
+    # --- RMS 匹配（官方 change_rms 逻辑）---
     if rms_mix_rate < 1.0:
-        rms_audio = np.sqrt(np.mean(audio ** 2))
-        rms_out = np.sqrt(np.mean(audio_out ** 2))
+        rms_in = np.sqrt(np.mean(audio.astype(np.float64) ** 2)) + 1e-9
+        rms_out = np.sqrt(np.mean(audio_out.astype(np.float64) ** 2)) + 1e-9
         if rms_out > 1e-6:
-            audio_out = audio_out * (rms_audio / rms_out) * (1 - rms_mix_rate) + audio_out * rms_mix_rate
+            audio_out = audio_out * ((rms_in / rms_out) ** (1 - rms_mix_rate))
 
-    # Resample
+    # --- 重采样回目标 ---
     out_sr = model.sample_rate
     if resample_sr > 0 and resample_sr != model.sample_rate:
-        import librosa
         audio_out = librosa.resample(audio_out, orig_sr=model.sample_rate, target_sr=resample_sr)
         out_sr = resample_sr
 
-    # 保证输出长度和输入一致（模型自然输出长度可能与块长略有偏差，重采样对齐）
-    if len(audio_out) != len(audio):
-        from scipy.signal import resample as _sig_resample
-        audio_out = _sig_resample(audio_out.astype(np.float64), len(audio)).astype(np.float32)
-
-    return audio_out, out_sr
+    return audio_out.astype(np.float32), out_sr
 
 
 def _align_f0_to_feats(f0: np.ndarray, n_feats: int) -> np.ndarray:
@@ -743,7 +892,7 @@ class RVCEngine:
         self,
         audio: np.ndarray,
         pitch_shift: int = 0,
-        f0_method: str = "rmvpe",
+        f0_method: str = "pm",
         index_rate: float = 0.75,
         rms_mix_rate: float = 0.25,
         resample_sr: int = 0,
@@ -785,7 +934,7 @@ def convert_file(
     input_path: str,
     output_path: str,
     pitch_shift: int = 0,
-    f0_method: str = "rmvpe",
+    f0_method: str = "pm",
     index_path: str | None = None,
     index_rate: float = 0.75,
     rms_mix_rate: float = 0.25,

@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
     QComboBox,
+    QDialog,
     QDoubleSpinBox,
     QFileDialog,
     QFrame,
@@ -76,7 +77,11 @@ from app.services.model_store import (
 )
 from app.services.rvc_service import RVCEngine, _gram_sample_length
 from app.services.motion_capture import MotionCapture, list_camera_devices
+from app.services.gesture import DEFAULT_GESTURE_ACTIONS, GESTURE_NAMES, gesture_name
+from app.services import model_actions
+from app.services import pose_gesture
 from app.services.settings_store import SettingsStore
+from app.services.voice_lipsync import VoiceLipSync
 from app.services.virtual_camera import (
     VIRTUAL_CAMERA_NAME,
     VirtualCameraError,
@@ -427,6 +432,23 @@ QPushButton#ghostButton:hover {
     border-color: #4AA9E8;
 }
 
+QPushButton#rowRemoveButton {
+    background: transparent;
+    border: 1px solid #284064;
+    border-radius: 6px;
+    color: #9DB5D8;
+    padding: 0;
+    min-width: 0;
+    min-height: 0;
+    font-size: 14px;
+}
+
+QPushButton#rowRemoveButton:hover {
+    color: #EAF6FF;
+    border-color: #4AA9E8;
+    background: rgba(255, 255, 255, 18);
+}
+
 QPushButton#smallGhostButton {
     background: transparent;
     border: 1px solid #284064;
@@ -609,6 +631,97 @@ def _make_simple_page(title: str) -> QWidget:
     return page
 
 
+class PoseGestureDialog(QDialog):
+    """录制自定义手势时的命名 / 宽紧对话框。
+
+    弹窗里给三样东西：**这一帧到底抓到了什么**（姿势摘要，让用户确认手是
+    在画面里的、抓的不是一个空姿势）、**名字**、**判定宽紧**。
+
+    为什么要给「宽紧」而不是一个数字容差：容差是归一化距离，用户没法凭
+    0.16 这个数判断松紧。这里换成三档人话，映射到
+    ``pose_gesture.DEFAULT_TOLERANCE`` 附近——严（0.10，要求摆得很准）、
+    标准（0.16）、松（0.24，动作幅度不定时用）。松档也不能再往上放：
+    「举右手」和「举左手」的距离是 0.42，拉过这个数就会互相误触发。
+    """
+
+    #: 档位 -> (容差, 说明)
+    LEVELS: tuple[tuple[float, str], ...] = (
+        (0.10, "严：动作要摆得比较准"),
+        (0.16, "标准"),
+        (0.24, "松：差不多就行（适合幅度不稳定 / 衣着宽松）"),
+    )
+
+    def __init__(self, parent, pose: dict, summary: str, default_name: str,
+                 hand_text: str = "") -> None:
+        super().__init__(parent)
+        self.setWindowTitle("录制自定义手势")
+        self.setModal(True)
+        self.setMinimumWidth(360)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(10)
+
+        captured = QLabel(f"已抓取当前动捕姿势：{summary}")
+        captured.setObjectName("hintText")
+        captured.setWordWrap(True)
+        layout.addWidget(captured)
+
+        # 「手势对不对得上」最容易在这里出错：用户做的是单指，界面上却是
+        # 握拳（手指没被读到 / 判据认错）。把**这一帧识别到的手型和逐指
+        # 弯曲度**直接打出来，对不上时一眼能看出是哪一环，不用猜。
+        if hand_text:
+            hands = QLabel(f"手型：{hand_text}")
+            hands.setObjectName("hintText")
+            hands.setWordWrap(True)
+            layout.addWidget(hands)
+
+        name_caption = QLabel("手势名称")
+        name_caption.setObjectName("hintText")
+        layout.addWidget(name_caption)
+        self.name_edit = QLineEdit()
+        self.name_edit.setObjectName("inputBox")
+        self.name_edit.setText(default_name)
+        self.name_edit.selectAll()
+        self.name_edit.returnPressed.connect(self.accept)
+        layout.addWidget(self.name_edit)
+
+        level_caption = QLabel("识别宽紧")
+        level_caption.setObjectName("hintText")
+        layout.addWidget(level_caption)
+        self.level_combo = ArrowComboBox()
+        self.level_combo.setObjectName("inputBox")
+        for index, (value, label) in enumerate(self.LEVELS):
+            self.level_combo.addItem(label, value)
+        default_index = 1
+        for index, (value, _label) in enumerate(self.LEVELS):
+            if abs(value - pose_gesture.DEFAULT_TOLERANCE) < 1e-6:
+                default_index = index
+        self.level_combo.setCurrentIndex(default_index)
+        layout.addWidget(self.level_combo)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        cancel = QPushButton("取消")
+        cancel.setObjectName("ghostButton")
+        cancel.clicked.connect(self.reject)
+        save = QPushButton("保存")
+        save.setObjectName("actionButton")
+        save.clicked.connect(self.accept)
+        buttons.addWidget(cancel)
+        buttons.addWidget(save)
+        layout.addLayout(buttons)
+
+    def result_payload(self) -> dict:
+        """``{"name": ..., "tolerance": ...}``。"""
+        name = self.name_edit.text().strip() or self.name_edit.placeholderText()
+        return {
+            "name": pose_gesture.clean_name(name),
+            "tolerance": float(self.level_combo.currentData()
+                               or pose_gesture.DEFAULT_TOLERANCE),
+        }
+
+
 class HomeWindow(QMainWindow):
     logout_requested = Signal()
     profile_loaded = Signal(dict)
@@ -647,8 +760,48 @@ class HomeWindow(QMainWindow):
         self.motion_capture.frame_ready.connect(self._on_motion_frame)
         self.motion_capture.drive_changed.connect(self._on_motion_drive)
         self.motion_capture.status_changed.connect(self._on_motion_status)
+        self.motion_capture.gesture_changed.connect(self._on_gesture_changed)
+        self.motion_capture.pose_gesture_changed.connect(self._on_pose_gesture_changed)
+        self.motion_capture.hands_status_changed.connect(self._on_hands_status_changed)
         self.motion_capture.set_engine(self.motion_settings.get("engine", "hybrid"))
         self.motion_capture.set_drive_params(self.motion_settings.get("params", {}))
+        self.motion_capture.set_hand_enabled(bool(self.motion_settings.get("hand_enabled", True)))
+        self.motion_capture.set_gesture_enabled(bool(self.motion_settings.get("gesture_enabled", True)))
+        self.motion_capture.set_hand_stride(int(self.motion_settings.get("hand_every", 1)))
+        #: 手势 -> 动作 id（``none`` / ``motion:<动作组>`` / ``expression:<表情>``）。
+        #: 可选项按当前模型动态生成，见 _rebuild_gesture_menus。
+        self.gesture_actions = dict(DEFAULT_GESTURE_ACTIONS)
+        saved_actions = self.motion_settings.get("gesture_actions")
+        if isinstance(saved_actions, dict):
+            for key, value in saved_actions.items():
+                if key in self.gesture_actions:
+                    self.gesture_actions[key] = value
+        #: 每个模型各一套手势配置：``{模型key: {"gestures": [手势行, ...]}}``。
+        #: 手势行既含默认手势（可删）也含用户录制的自定义姿势手势，是列表界面的
+        #: 唯一数据源；``gesture_actions`` 只作模型未加载时的兜底与迁移来源。
+        self.gesture_profiles = self.motion_settings.get("gesture_profiles")
+        if not isinstance(self.gesture_profiles, dict):
+            self.gesture_profiles = {}
+        #: 当前手势列表的呈现行（每个模型一套，见 _gesture_rows）
+        self._gesture_rows_cache: list[dict] = []
+        #: 手势 id -> 界面控件（下拉框与整行容器），重建列表时复用
+        self.gesture_combos: dict[str, ArrowComboBox] = {}
+        self._gesture_row_widgets: dict[str, dict] = {}
+        #: 姿势手势的实时状态（当前命中的自定义手势 id），只用于提示
+        self._pose_gesture_state = {"id": ""}
+        #: 最近一次识别到的内置手势（「左手 比耶」这样的文案），和姿势手势一起显示
+        self._gesture_active_label = ""
+        #: 动捕线程最近报来的**手型**文案（「左手 握拳」/「手部：未检测到」）。
+        #: 只是原材料，真正显示的文字由 ``_hands_status_line()`` 合成。
+        self._hand_status_text = ""
+        self._gesture_expression = {"kind": "", "until": 0.0}
+        self._gesture_menu_model: list[str] = []
+        self.lipsync_settings = self.settings_store.load_lipsync()
+        self._voice_lipsync = VoiceLipSync()
+        self._voice_lipsync.set_gain(float(self.lipsync_settings.get("gain", 1.4)))
+        self._lipsync_timer = QTimer(self)
+        self._lipsync_timer.setInterval(50)  # 20 FPS，口型不需要跟动捕同频
+        self._lipsync_timer.timeout.connect(self._on_lipsync_tick)
         self.profile_data: dict = {}
         self.personal_page_index = 0
         self._avatar_running = False  # 模型预览是否处于启动（显示）状态
@@ -684,17 +837,27 @@ class HomeWindow(QMainWindow):
         self.cloud_presets_error.connect(self._on_cloud_presets_error)
         self.rvc_status_changed.connect(self._on_rvc_status_changed)
         self.rvc_volume_updated.connect(self._on_rvc_volume_updated)
+        self._mixer_dialog = None
         self.server_status_changed.connect(self._on_server_status_changed)
         self.camera_devices_loaded.connect(self._on_camera_devices_loaded)
         self.vcam_install_done.connect(self._on_vcam_install_done)
         self._start_server_monitor()
         self._refresh_camera_devices()
 
+        # 语音驱动口型：启用后一直跑定时器，读到的口型直接写进当前模型视图
+        if bool(self.lipsync_settings.get("enabled", False)):
+            self._voice_lipsync.set_enabled(True)
+            self._set_lipsync_controls(enabled=True)
+            self._lipsync_timer.start()
+
     def closeEvent(self, event: QCloseEvent) -> None:
         self._closing = True
         timer = getattr(self, "_server_timer", None)
         if timer is not None:
             timer.stop()
+        lipsync_timer = getattr(self, "_lipsync_timer", None)
+        if lipsync_timer is not None:
+            lipsync_timer.stop()
         stream_timer = getattr(self, "_stream_timer", None)
         if stream_timer is not None:
             stream_timer.stop()
@@ -703,6 +866,7 @@ class HomeWindow(QMainWindow):
             camera.stop()
         self._save_rvc_settings()
         self._save_system_settings()
+        self._shutdown_mixer()
         self._shutdown_live2d()
         self.motion_capture.shutdown()
         super().closeEvent(event)
@@ -830,6 +994,9 @@ class HomeWindow(QMainWindow):
 
     def _open_page(self, index: int) -> None:
         self.pages.setCurrentIndex(index)
+        # 切页时按当前状态重画一遍启停入口：别处已经启动的动捕 / 形象，在这一页
+        # 的按钮上也得是「已启动」的样子（用户报的就是切到形象页停在「启动」）
+        self._refresh_runtime_controls()
         self.nav_group.setExclusive(False)
         for button in self.nav_group.buttons():
             button.setChecked(False)
@@ -1043,12 +1210,111 @@ class HomeWindow(QMainWindow):
         start_stop.addWidget(self.motion_stop_button)
         start_stop.addStretch()
         controls_box.addLayout(start_stop)
+
+        # ---- 手部与手势（手势可触发动作/表情） ----
+        hand_title = QLabel("手部与手势")
+        hand_title.setObjectName("panelTitle")
+        controls_box.addWidget(hand_title)
+
+        self.hand_enabled_checkbox = QCheckBox("手部驱动（手臂/手指跟随）")
+        self.hand_enabled_checkbox.setObjectName("toggle")
+        self.hand_enabled_checkbox.setChecked(bool(self.motion_settings.get("hand_enabled", True)))
+        self.hand_enabled_checkbox.toggled.connect(self._on_hand_enabled_changed)
+        controls_box.addWidget(self.hand_enabled_checkbox)
+
+        self.gesture_enabled_checkbox = QCheckBox("手势触发动作 / 表情")
+        self.gesture_enabled_checkbox.setObjectName("toggle")
+        self.gesture_enabled_checkbox.setChecked(bool(self.motion_settings.get("gesture_enabled", True)))
+        self.gesture_enabled_checkbox.toggled.connect(self._on_gesture_enabled_changed)
+        controls_box.addWidget(self.gesture_enabled_checkbox)
+
+        # 手部检测抽帧间隔：直接决定手指/手腕有多「跟手」
+        stride_row = QHBoxLayout()
+        stride_row.setSpacing(8)
+        stride_caption = QLabel("跟手速度")
+        stride_caption.setObjectName("hintText")
+        stride_row.addWidget(stride_caption)
+        self.hand_stride_combo = ArrowComboBox()
+        self.hand_stride_combo.setObjectName("inputBox")
+        for value, label in (
+            (1, "每帧（最跟手）"),
+            (2, "隔帧"),
+            (3, "每 3 帧"),
+            (4, "每 4 帧（省算力）"),
+        ):
+            self.hand_stride_combo.addItem(label, value)
+        stride_index = self.hand_stride_combo.findData(int(self.motion_settings.get("hand_every", 1)))
+        self.hand_stride_combo.setCurrentIndex(max(stride_index, 0))
+        self.hand_stride_combo.currentIndexChanged.connect(self._on_hand_stride_changed)
+        stride_row.addWidget(self.hand_stride_combo, 1)
+        controls_box.addLayout(stride_row)
+
+        self.hands_status_label = QLabel("手部：未检测到")
+        self.hands_status_label.setObjectName("hintText")
+        self.hands_status_label.setWordWrap(True)
+        controls_box.addWidget(self.hands_status_label)
+
+        # 手势列表：默认的七条 + 用户录制的自定义姿势手势，按当前模型各存一套。
+        # 行是动态的（可删默认手势、可加自定义手势），所以只在这里建一个空网格，
+        # 内容交给 _rebuild_gesture_menus() 填。
+        gesture_grid = QGridLayout()
+        gesture_grid.setContentsMargins(0, 0, 0, 0)
+        gesture_grid.setHorizontalSpacing(8)
+        gesture_grid.setVerticalSpacing(4)
+        head = QLabel("手势")
+        head.setObjectName("hintText")
+        gesture_grid.addWidget(head, 0, 0)
+        head_action = QLabel("触发动作")
+        head_action.setObjectName("hintText")
+        gesture_grid.addWidget(head_action, 0, 1)
+        self.gesture_grid = gesture_grid
+        controls_box.addLayout(gesture_grid)
+        self.gesture_menu_hint = QLabel("")
+        self.gesture_menu_hint.setObjectName("hintText")
+        self.gesture_menu_hint.setWordWrap(True)
+        controls_box.addWidget(self.gesture_menu_hint)
+
+        # 手势设置：录当前动捕姿势当手势、把默认手势恢复回来
+        gesture_tools = QHBoxLayout()
+        gesture_tools.setSpacing(8)
+        self.gesture_record_button = QPushButton("＋ 录制自定义手势")
+        self.gesture_record_button.setObjectName("ghostButton")
+        self.gesture_record_button.clicked.connect(self._on_record_pose_gesture)
+        self.gesture_reset_button = QPushButton("恢复默认手势")
+        self.gesture_reset_button.setObjectName("ghostButton")
+        self.gesture_reset_button.clicked.connect(self._on_reset_gesture_rows)
+        gesture_tools.addWidget(self.gesture_record_button)
+        gesture_tools.addWidget(self.gesture_reset_button)
+        gesture_tools.addStretch()
+        controls_box.addLayout(gesture_tools)
+
+        # 选项来自当前模型实际支持的动作 / 表情，不是写死的列表
+        self._rebuild_gesture_menus()
+        self._refresh_gesture_ui()
+
         controls_box.addStretch()
         self.motion_controls_card = controls_card
 
         values_card, values_box = self._make_clickable_card("驱动数值", "values")
         self.motion_value_labels: dict[str, QLabel] = {}
-        for cap, key in (("头部左右", "angle_x"), ("头部上下", "angle_y"), ("头部翻转", "angle_z")):
+        for cap, key in (
+            ("头部左右", "angle_x"),
+            ("头部上下", "angle_y"),
+            ("头部翻转", "angle_z"),
+            ("左手抬落", "arm_l"),
+            ("右手抬落", "arm_r"),
+            ("左手侧摆", "arm_l_x"),
+            ("右手侧摆", "arm_r_x"),
+            ("左上臂摆动", "arm_swing_l"),
+            ("右上臂摆动", "arm_swing_r"),
+            ("左肘弯曲", "elbow_l"),
+            ("右肘弯曲", "elbow_r"),
+            ("左臂前倾", "arm_fwd_l"),
+            ("右臂前倾", "arm_fwd_r"),
+            ("左手弯曲", "hand_l"),
+            ("右手弯曲", "hand_r"),
+            ("嘴型开合", "mouth_open"),
+        ):
             row = QHBoxLayout()
             name = QLabel(cap)
             name.setObjectName("hintText")
@@ -1059,6 +1325,16 @@ class HomeWindow(QMainWindow):
             row.addWidget(value, 1)
             values_box.addLayout(row)
             self.motion_value_labels[key] = value
+
+        gesture_row = QHBoxLayout()
+        gesture_caption = QLabel("识别手势")
+        gesture_caption.setObjectName("hintText")
+        self.gesture_value_label = QLabel("—")
+        self.gesture_value_label.setObjectName("infoValue")
+        self.gesture_value_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        gesture_row.addWidget(gesture_caption)
+        gesture_row.addWidget(self.gesture_value_label, 1)
+        values_box.addLayout(gesture_row)
         self.motion_values_card = values_card
 
         self.motion_area = QWidget()
@@ -1335,6 +1611,11 @@ class HomeWindow(QMainWindow):
         self.motion_capture.set_lr_mirror(bool(self.motion_settings.get("lr_mirror", False)))
         self.motion_capture.set_sensitivity(float(self.motion_settings.get("sensitivity", 1.0)))
         self.motion_capture.set_drive_enabled(bool(self.motion_settings.get("drive_enabled", True)))
+        self.motion_capture.set_hand_enabled(bool(self.motion_settings.get("hand_enabled", True)))
+        self.motion_capture.set_gesture_enabled(
+            bool(self.motion_settings.get("gesture_enabled", True))
+        )
+        self.motion_capture.set_hand_stride(int(self.motion_settings.get("hand_every", 1)))
 
     def _save_motion_settings(self) -> None:
         self.settings_store.save_motion(self.motion_settings)
@@ -1460,18 +1741,685 @@ class HomeWindow(QMainWindow):
         if not checked and getattr(self, "live2d_view", None) is not None:
             self.live2d_view.reset_drive()
 
+    # ------------------------------------------------------------------
+    # 手部驱动与手势触发
+    # ------------------------------------------------------------------
+
+    def _on_hand_enabled_changed(self, checked: bool) -> None:
+        self.motion_settings["hand_enabled"] = bool(checked)
+        self.motion_capture.set_hand_enabled(bool(checked))
+        self._save_motion_settings()
+        self._refresh_gesture_ui()
+
+    def _on_gesture_enabled_changed(self, checked: bool) -> None:
+        self.motion_settings["gesture_enabled"] = bool(checked)
+        self.motion_capture.set_gesture_enabled(bool(checked))
+        self._save_motion_settings()
+        self._refresh_gesture_ui()
+
+    def _on_hand_stride_changed(self) -> None:
+        """手部检测抽帧间隔：越小越跟手，越大越省算力。"""
+        combo = getattr(self, "hand_stride_combo", None)
+        if combo is None:
+            return
+        stride = int(combo.currentData() or 1)
+        self.motion_settings["hand_every"] = stride
+        self.motion_capture.set_hand_stride(stride)
+        self._save_motion_settings()
+
+    def _on_gesture_action_changed(self, gesture: str, combo) -> None:
+        action = combo.currentData() or model_actions.ACTION_NONE
+        self._set_row_action(gesture, action)
+
+    # ------------------------------------------------------------------
+    # 手势列表：每个模型各一套（默认手势可删，可加自定义姿势手势）
+    # ------------------------------------------------------------------
+
+    def _current_model_key(self) -> str:
+        """当前手势配置挂在哪个模型名下（``live2d:hiyori_pro`` 这样的键）。
+
+        优先用「已启用」的那个模型；还没有启用的就用列表里第一个同类型模型
+        ——用户刚导入还没点「使用」时也得能配手势，否则录下来的自定义手势
+        无处可存。一个模型都没有时退回公共档 ``__default__``。
+        """
+        kind = self._current_avatar_kind()
+        entries = [entry for entry in getattr(self, "model_entries", []) if entry.kind == kind]
+        active = next((entry for entry in entries if entry.active), None)
+        entry = active or (entries[0] if entries else None)
+        if entry is None:
+            return pose_gesture.FALLBACK_PROFILE_KEY
+        key = pose_gesture.model_key(kind, entry.name)
+        return key or pose_gesture.FALLBACK_PROFILE_KEY
+
+    def _gesture_rows(self) -> list[dict]:
+        """当前模型的手势行（列表界面的唯一数据源）。
+
+        三条来源，优先级从高到低：
+
+        1. 当前模型自己那份配置（用户删过默认手势、加过自定义手势，以它为准）；
+        2. 公共档 ``__default__``（还没绑定到具体模型时录的手势）；
+        3. 内置的七条默认手势（动作从老字段 ``gesture_actions`` 迁移过来）。
+        """
+        profiles = getattr(self, "gesture_profiles", None)
+        key = self._current_model_key()
+        actions = getattr(self, "gesture_actions", None) or {}
+        rows = pose_gesture.rows_for(profiles, key, actions)
+        if rows:
+            rows = [dict(row) for row in rows]
+            # 默认手势的动作以 ``gesture_actions`` 为准：它是默认手势动作的镜像
+            # （每次落盘都会同步），也是模型未加载时的兜底。两边万一不同步
+            # （老配置、外部改过），以这份老字段为准，免得用户觉得配置丢了。
+            for row in rows:
+                if str(row.get("kind") or "builtin") != "builtin":
+                    continue
+                gesture_id = str(row.get("id"))
+                if gesture_id in actions:
+                    row["action"] = str(actions[gesture_id] or model_actions.ACTION_NONE)
+            return rows
+        # 空列表是「用户把默认手势全删了」的明确意图，只有真的没配过才用兜底
+        if isinstance(profiles, dict) and key in profiles:
+            return []
+        combos = getattr(self, "gesture_combos", None)
+        if combos:
+            # 自检 / 老代码里手工塞过下拉框：以那些键为准造行，别把它们丢掉
+            return self._rows_from_keys(list(combos.keys()), actions)
+        return pose_gesture.default_rows(actions)
+
+    def _rows_from_keys(self, keys: list[str], actions: dict) -> list[dict]:
+        """按给定的手势 id 列表造行（顺序先按内置顺序，多余的排后面）。"""
+        ordered = [key for key in pose_gesture.BUILTIN_GESTURE_ORDER if key in keys]
+        ordered += [key for key in keys if key not in ordered]
+        rows: list[dict] = []
+        for key in ordered:
+            rows.append({
+                "id": key,
+                "name": GESTURE_NAMES.get(key, key),
+                "kind": "builtin",
+                "pose": None,
+                "tolerance": pose_gesture.DEFAULT_TOLERANCE,
+                "action": str(actions.get(key, model_actions.ACTION_NONE) or "none"),
+            })
+        return rows
+
+    def _action_for_gesture(self, gesture_id: str) -> str:
+        """取某个手势此刻绑定的动作。
+
+        规则和 :meth:`_gesture_rows` 对齐：
+
+        * 自定义手势只有手势行里存着它，直接读行；
+        * 默认手势的动作以 ``gesture_actions`` 为准（模型未加载时的兜底；
+          用户把某条默认手势从列表里删了，就不在这里了 —— 返回「不响应」，
+          **这样「删掉默认手势」才是真的删掉**，否则手一比划还会触发）。
+        """
+        row = None
+        for item in getattr(self, "_gesture_rows_cache", []) or []:
+            if item.get("id") == gesture_id:
+                row = item
+                break
+        if row is not None and str(row.get("kind") or "builtin") == "custom":
+            return str(row.get("action") or model_actions.ACTION_NONE)
+        actions = getattr(self, "gesture_actions", None) or {}
+        if row is not None:
+            return str(actions.get(gesture_id, row.get("action"))
+                       or model_actions.ACTION_NONE)
+        if getattr(self, "_gesture_rows_cache", None):
+            # 列表是加载过的，里面没有它 = 用户删掉了这条手势
+            return model_actions.ACTION_NONE
+        return str(actions.get(gesture_id, model_actions.ACTION_NONE))
+
+    def _gesture_display_name(self, gesture_id: str) -> str:
+        for row in getattr(self, "_gesture_rows_cache", []) or []:
+            if row.get("id") == gesture_id:
+                return str(row.get("name") or gesture_id)
+        return GESTURE_NAMES.get(gesture_id, gesture_id)
+
+    def _set_row_action(self, gesture_id: str, action: str) -> None:
+        """改某条手势绑定的动作并落盘。"""
+        for row in getattr(self, "_gesture_rows_cache", []) or []:
+            if row.get("id") == gesture_id:
+                row["action"] = str(action or model_actions.ACTION_NONE)
+                break
+        self._persist_gesture_rows()
+
+    def _persist_gesture_rows(self, rebuild: bool = False) -> None:
+        """把手势行写进「当前模型」那份配置，并同步旧字段 ``gesture_actions``。
+
+        ``gesture_actions`` 只保留默认手势那部分，作用是给「模型还没加载出来」
+        的时刻兜底（那时没有模型能力可言，只能照搬上次的动作）。
+        """
+        rows = getattr(self, "_gesture_rows_cache", None)
+        if rows is None:
+            return
+        key = self._current_model_key()
+        profiles = pose_gesture.set_rows(getattr(self, "gesture_profiles", None), key, rows)
+        self.gesture_profiles = profiles
+        self.motion_settings["gesture_profiles"] = profiles
+        # 默认手势的动作镜像回老字段：模型还没加载出来的时候没有能力清单可查，
+        # 只能照搬这份映射。**整份替换**而不是 update——被删掉的那条默认手势
+        # 必须从映射里消失，否则手一比划又会触发它。
+        builtin = pose_gesture.builtin_actions(rows)
+        self.gesture_actions = {
+            name: str(builtin.get(name, model_actions.ACTION_NONE) or model_actions.ACTION_NONE)
+            for name in pose_gesture.BUILTIN_GESTURE_ORDER
+        }
+        self.motion_settings["gesture_actions"] = dict(self.gesture_actions)
+        self._sync_pose_gestures()
+        self._save_motion_settings()
+        if rebuild:
+            self._rebuild_gesture_menus()
+
+    def _sync_pose_gestures(self) -> None:
+        """把自定义姿势手势模板推给动捕线程（只有带 pose 的才会参与匹配）。"""
+        capture = getattr(self, "motion_capture", None)
+        setter = getattr(capture, "set_pose_gestures", None)
+        if setter is None:
+            return
+        try:
+            setter([row for row in getattr(self, "_gesture_rows_cache", []) or []
+                    if row.get("pose")])
+        except Exception:
+            pass
+
+    def _hand_shape_text(self, pose: dict) -> str:
+        """录制弹窗里的「手型」一行：这一帧识别到的手型 + 逐指弯曲度。
+
+        「做的是单指、界面却抓到握拳」这种问题没法靠看画面判断（到底是手指
+        没被读到，还是判据把它认成握拳了），所以把三样原始数据都打出来：
+
+        * 识别出的手型名——:meth:`MotionCapture.current_hand_shapes`（**这一帧**
+          的结果，不是去抖后的触发状态）；
+        * 逐指弯曲度——这一帧的姿势快照（0 = 伸直、1 = 握起）；
+        * 弯曲度是**从哪种坐标**算出来的——``current_hand_geometry``。写着
+          「二维像素」就说明 MediaPipe 这一帧没给世界坐标、退回了投影，读数是
+          被压扁的（伸直的食指会读成弯曲），那要先解决数据源而不是调判据。
+        """
+        shapes: dict = {}
+        sources: dict = {}
+        capture = getattr(self, "motion_capture", None)
+        getter = getattr(capture, "current_hand_shapes", None)
+        if getter is not None:
+            try:
+                shapes = dict(getter() or {})
+            except Exception:
+                shapes = {}
+        source_getter = getattr(capture, "current_hand_geometry", None)
+        if source_getter is not None:
+            try:
+                sources = dict(source_getter() or {})
+            except Exception:
+                sources = {}
+        parts: list[str] = []
+        for side, who in (("l", "左手"), ("r", "右手")):
+            # pose 来自 pose_gesture.capture()，值一定是 float
+            curls = [float(pose.get(f"finger_{side}_{index}") or 0.0)
+                     for index in range(5)]
+            shape = shapes.get(side) or ""
+            if not shape and max(curls) <= 1e-6:
+                # 这一侧没手，也没识别到任何东西：不占版面
+                continue
+            label = GESTURE_NAMES.get(shape, "手型未识别") if shape else "手型未识别"
+            detail = " ".join(f"{value:.2f}" for value in curls)
+            source = sources.get(side)
+            if source == "pixels":
+                detail += "；二维像素（读数可能被压扁）"
+            elif source == "world":
+                detail += "；世界坐标"
+            parts.append(f"{who} {label}（食/中/无名/小/拇 {detail}）")
+        if not parts:
+            return "没读到手指弯曲度（手可能没进画面）"
+        return "；".join(parts)
+
+    def _on_record_pose_gesture(self) -> None:
+        """录制自定义手势：抓当前动捕姿势 -> 起名 -> 存进当前模型的配置。"""
+        capture = getattr(self, "motion_capture", None)
+        if capture is None:
+            return
+        if not capture.is_running():
+            show_warning(self, "星弦", "请先点「开始动捕」，把手摆成想要的姿势，再录制手势。")
+            return
+        if not capture.hand_detected():
+            show_warning(self, "星弦", "画面里没有检测到手部，请把手放进画面再录制。")
+            return
+        current = capture.current_pose()
+        if pose_gesture.is_blank(current):
+            show_warning(self, "星弦", "这一帧没有读到手臂姿势，请把手抬起来一点再录。")
+            return
+
+        rows = self._gesture_rows()
+        custom_count = sum(1 for row in rows if row.get("kind") == "custom")
+        dialog = PoseGestureDialog(
+            self, current, pose_gesture.summarize(current), f"我的手势 {custom_count + 1}",
+            self._hand_shape_text(current),
+        )
+        if dialog.exec() != QDialog.Accepted:
+            return
+        payload = dialog.result_payload()
+        entry = pose_gesture.make_custom_gesture(
+            payload["name"], current, existing_ids=[row.get("id") for row in rows],
+            tolerance=payload["tolerance"],
+        )
+        rows.append(entry)
+        self._gesture_rows_cache = rows
+        self._persist_gesture_rows(rebuild=True)
+
+    def _on_reset_gesture_rows(self) -> None:
+        """把内置的七条默认手势补回列表。
+
+        只**补缺失的**，已经在列表里的保持原样（用户改过的动作不会被冲掉），
+        自定义手势也全部保留——「恢复默认」不该顺手删掉用户自己录的东西，
+        要删有每行末尾的「×」。
+        """
+        rows = self._gesture_rows()
+        existing = {str(row.get("id")): row for row in rows}
+        defaults = {
+            row["id"]: row for row in pose_gesture.default_rows(self.gesture_actions)
+        }
+        merged: list[dict] = []
+        for key in pose_gesture.BUILTIN_GESTURE_ORDER:
+            merged.append(existing.get(key) or defaults[key])
+        merged += [
+            row for row in rows
+            if str(row.get("id")) not in pose_gesture.BUILTIN_GESTURE_ORDER
+        ]
+        self._gesture_rows_cache = merged
+        self._persist_gesture_rows(rebuild=True)
+
+    def _delete_gesture_row(self, gesture_id: str, ask: bool = True) -> None:
+        """删掉一条手势（默认手势也能删）。
+
+        自定义手势删掉后姿势模板就没了，所以默认弹一次确认；自检里传
+        ``ask=False`` 直接删，免得要模拟点击。
+        """
+        rows = [row for row in self._gesture_rows() if row.get("id") != gesture_id]
+        if len(rows) == len(self._gesture_rows()):
+            return
+        target = next(
+            (row for row in self._gesture_rows() if row.get("id") == gesture_id), None
+        )
+        if ask and target is not None and target.get("kind") == "custom":
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Question)
+            box.setWindowTitle("删除自定义手势")
+            box.setText(f"删除「{target.get('name')}」？录下来的姿势模板会一起丢掉。")
+            box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+            box.setDefaultButton(QMessageBox.No)
+            if box.exec() != QMessageBox.Yes:
+                return
+        self._gesture_rows_cache = rows
+        self._persist_gesture_rows(rebuild=True)
+
+    def _on_delete_gesture_row(self, gesture_id: str) -> None:
+        self._delete_gesture_row(gesture_id, ask=True)
+
+    def _on_pose_gesture_changed(self, gesture_id: str) -> None:
+        """动捕线程确认某个自定义姿势手势成立（或解除）时触发动作。"""
+        if not gesture_id:
+            self._pose_gesture_state["id"] = ""
+            self._refresh_gesture_status()
+            return
+        if gesture_id == self._pose_gesture_state.get("id"):
+            return
+        self._pose_gesture_state["id"] = gesture_id
+        self._refresh_gesture_status()
+        self._trigger_gesture_action(self._action_for_gesture(gesture_id))
+
+    def _available_actions(self, view=None) -> list[tuple[str, str]]:
+        """当前模型支持的动作 / 表情菜单项，``[(动作 id, 显示名), ...]``。"""
+        view = view if view is not None else self._active_model_view()
+        menu: list[tuple[str, str]] = []
+        getter = getattr(view, "available_actions", None)
+        if getter is not None:
+            try:
+                menu = [(str(a), str(l)) for a, l in getter()]
+            except Exception:
+                menu = []
+        if not menu or menu[0][0] != model_actions.ACTION_NONE:
+            menu.insert(0, (model_actions.ACTION_NONE, "不响应"))
+        return menu
+
+    @staticmethod
+    def _capabilities_from_menu(menu) -> model_actions.ModelCapabilities:
+        """从菜单项反推能力清单。
+
+        直接由菜单反推而不是另外问一次模型，能保证「菜单里有的」和
+        「能解析的」永远一致——否则会出现下拉框列着某动作、选中却解析失败。
+        """
+        caps = model_actions.ModelCapabilities()
+        for action, _label in menu:
+            kind, name = model_actions.split_action(action)
+            if not isinstance(name, str):
+                continue
+            if kind == "motion":
+                caps.motions.append(name)
+            elif kind == "expression":
+                caps.expressions.append(name)
+        return caps
+
+    def _resolve_row_action(self, row: dict, caps, defaults: dict) -> str:
+        """把一条手势行绑的动作落到当前模型的真名上。
+
+        解析不出来时：默认手势换成按模型能力推导的默认动作（用户看到一个
+        能用的动作总比点了没反应强），自定义手势退回「不响应」——它是个新
+        概念，没有可以推导的历史默认值。
+        """
+        current = str(row.get("action") or model_actions.ACTION_NONE)
+        is_builtin = str(row.get("kind") or "builtin") == "builtin"
+        if current == model_actions.ACTION_NONE:
+            # 用户显式选的「不响应」是一种选择，不是失效
+            return current
+        resolved = model_actions.resolve_action(current, caps)
+        if resolved is None:
+            return defaults.get(row.get("id"), model_actions.ACTION_NONE) if is_builtin \
+                else model_actions.ACTION_NONE
+        # 解析得出来也要**规范化成前缀形式**：老配置里存的是 ``wave`` /
+        # ``expression_smile``，而下拉框里的数据是 ``motion:wave``，不换写法
+        # findData 会失配，界面就显示回「不响应」了——看着像没生效。
+        kind, name = resolved
+        prefix = (
+            model_actions.PREFIX_MOTION
+            if kind == "motion"
+            else model_actions.PREFIX_EXPRESSION
+        )
+        return prefix + name
+
+    def _sync_gesture_grid(self, rows: list[dict]) -> None:
+        """按手势行重建网格控件；没有界面（自检里绕开 __init__）时自动跳过。"""
+        grid = getattr(self, "gesture_grid", None)
+        if grid is None:
+            return
+        for widgets in getattr(self, "_gesture_row_widgets", {}).values():
+            for widget in widgets.values():
+                # 必须先 removeWidget 再删：只调 setParent(None) 的话布局项还挂在
+                # 网格里，重建几次就会在新行位置上叠出一堆看不见的旧行（格子越来
+                # 越多、行距被撑开）。表头两个标签不在这里，所以不会被误删。
+                grid.removeWidget(widget)
+                widget.setParent(None)
+                widget.deleteLater()
+        self._gesture_row_widgets = {}
+        self.gesture_combos = {}
+
+        for index, row in enumerate(rows, start=1):
+            gesture_id = str(row.get("id"))
+            name = QLabel(self._gesture_row_label(row))
+            name.setObjectName("hintText")
+            if row.get("pose"):
+                name.setToolTip("自定义姿势手势：" + pose_gesture.summarize(row["pose"]))
+            grid.addWidget(name, index, 0)
+
+            combo = ArrowComboBox()
+            combo.setObjectName("inputBox")
+            combo.currentIndexChanged.connect(
+                lambda _=0, k=gesture_id, c=combo: self._on_gesture_action_changed(k, c)
+            )
+            grid.addWidget(combo, index, 1)
+            self.gesture_combos[gesture_id] = combo
+
+            # 专用紧凑样式：`ghostButton` 的样式表写死了 `min-width: 96px` /
+            # `min-height: 32px`，而 Qt 里**样式表的 min-width 会盖过 setFixedWidth**，
+            # 于是这个「×」被撑成一个 96×32 的大方块。换成 padding:0 / min-*:0 的
+            # 专用 objectName，尺寸才真的听 setFixedSize 的。
+            remove = QPushButton("×")
+            remove.setObjectName("rowRemoveButton")
+            remove.setFixedSize(24, 24)
+            remove.setToolTip("删除这个手势")
+            remove.clicked.connect(
+                lambda _=0, k=gesture_id: self._on_delete_gesture_row(k)
+            )
+            # 垂直居中对齐：同行的下拉框比它高时，24px 的方按钮不该被顶到格子顶部
+            grid.addWidget(remove, index, 2, Qt.AlignVCenter)
+            self._gesture_row_widgets[gesture_id] = {
+                "name": name, "combo": combo, "remove": remove,
+            }
+
+    @staticmethod
+    def _gesture_row_label(row: dict) -> str:
+        """行首显示什么：默认手势用中文名，自定义手势加个记号。"""
+        name = str(row.get("name") or row.get("id"))
+        if str(row.get("kind") or "builtin") == "custom":
+            return f"{name}（自定义）"
+        return GESTURE_NAMES.get(str(row.get("id")), name)
+
+    def _rebuild_gesture_menus(self) -> None:
+        """按当前模型重建手势列表与每一行的动作下拉框。
+
+        这是「模型的手势动作，每个模型单独配置保存」的落点：列表内容（有哪些
+        手势、默认的保留还是删掉、自定义的录了什么）和每行绑的动作都按模型
+        各存一份；选项本身来自模型真正拥有的动作组和表情名。换模型时旧映射
+        多半已经不存在了（Live2D 的表情叫「生气」「爱心」，VRM 叫 happy/angry，
+        两套名字毫无交集），所以顺带把失效的选择回退成按新模型能力推导的
+        默认动作，免得用户对着一个点了没反应的选项发呆。
+
+        两条不能踩的线：
+
+        * 用户显式选的「不响应」要保留——那是一种选择，不是失效；
+        * **模型还没加载时绝不改写已存的映射**。构造界面时手上还没有模型，
+          这时若把七个手势全刷成「不响应」，用户上次配好的映射就白丢了
+          （等模型加载完会再重建一次，那时按真能力迁移才是有意义的）。
+        """
+        rows = self._gesture_rows()
+        menu = self._available_actions()
+        caps = self._capabilities_from_menu(menu)
+
+        changed = False
+        if not caps.is_empty():
+            builtin_ids = [str(row.get("id")) for row in rows
+                           if str(row.get("kind") or "builtin") == "builtin"]
+            defaults = model_actions.default_actions(caps, tuple(builtin_ids))
+            for row in rows:
+                resolved = self._resolve_row_action(row, caps, defaults)
+                if resolved != row.get("action"):
+                    row["action"] = resolved
+                    changed = True
+
+        self._gesture_rows_cache = rows
+        self._sync_gesture_grid(rows)
+        # 先把迁移结果落盘再配下拉框：`_action_for_gesture` 对默认手势是查
+        # `gesture_actions` 的（那是模型未加载时的兜底），这时它还是老的写死 id
+        # （``wave``），而菜单里放的是 ``motion:wave``，不先同步就会 findData 失配、
+        # 界面显示回「不响应」。
+        if not caps.is_empty() and changed:
+            self._persist_gesture_rows()
+        for gesture_id, combo in self.gesture_combos.items():
+            combo.blockSignals(True)
+            combo.clear()
+            for action, label in menu:
+                combo.addItem(label, action)
+            index = combo.findData(self._action_for_gesture(gesture_id))
+            combo.setCurrentIndex(index if index >= 0 else 0)
+            combo.blockSignals(False)
+
+        self._gesture_menu_model = [action for action, _ in menu]
+        # 自定义手势模板要立刻推给动捕线程，否则刚录的手势要等下次开动捕才生效
+        self._sync_pose_gestures()
+        hint = getattr(self, "gesture_menu_hint", None)
+        if hint is not None:
+            hint.setText(self._gesture_menu_hint())
+
+    def _gesture_menu_hint(self) -> str:
+        """给手势那一栏的副标题，说明当前选项是从哪来的。"""
+        rows = getattr(self, "_gesture_rows_cache", []) or []
+        custom = [row for row in rows if row.get("kind") == "custom"]
+        pose_note = f"，{len(custom)} 个自定义手势（按姿势自动触发）" if custom else ""
+        if not rows:
+            return "手势列表是空的，点「＋ 录制自定义手势」或「恢复默认手势」开始配置"
+        view = self._active_model_view()
+        if view is None:
+            return f"共 {len(rows)} 个手势{pose_note}；尚未加载模型，暂无可触发的动作"
+        caps = self._capabilities_from_menu(self._available_actions())
+        if caps.is_empty():
+            return f"共 {len(rows)} 个手势{pose_note}；当前模型没有可用的动作 / 表情"
+        return (
+            f"共 {len(rows)} 个手势{pose_note}｜"
+            f"当前模型支持 {len(caps.motions)} 个动作、{len(caps.expressions)} 个表情"
+        )
+
+    def _refresh_gesture_ui(self) -> None:
+        """手势下拉只在「手部驱动 + 手势触发」都开着时可编辑。"""
+        usable = bool(self.motion_settings.get("hand_enabled", True)) and bool(
+            self.motion_settings.get("gesture_enabled", True)
+        )
+        for combo in getattr(self, "gesture_combos", {}).values():
+            combo.setEnabled(usable)
+        for button in (getattr(self, "gesture_record_button", None),
+                       getattr(self, "gesture_reset_button", None)):
+            if button is not None:
+                button.setEnabled(usable)
+        self._refresh_hands_status()
+
+    def _pose_gesture_display_name(self) -> str:
+        """当前命中的自定义姿势手势名（没有命中就是空串）。"""
+        pose_id = (getattr(self, "_pose_gesture_state", None) or {}).get("id")
+        return self._gesture_display_name(pose_id) if pose_id else ""
+
+    def _hands_status_line(self) -> str:
+        """「手部驱动」卡片里那一行状态文字该显示什么。
+
+        **手势优先、手型垫底**：
+
+        * 自定义姿势手势命中 -> ``手势：<你给它起的名字>``；
+        * 内置手型已稳定触发 -> ``手势：左手 握拳``（内置那七种同样会触发动作）；
+        * 都没触发 -> ``手型：左手 握拳`` / ``手部：未检测到``。
+
+        以前这一行直接转动手型链路的原始文字（光写「左手 握拳」），于是做自定义
+        手势时用户会以为系统把自己的手势认成了握拳——其实动作是对的，只是这行字
+        报的是**另一条链路**（手型分类）的结论。现在两条链路各带名字，一眼分得清。
+        """
+        pose_name = self._pose_gesture_display_name()
+        if pose_name:
+            return f"手势：{pose_name}"
+        builtin = str(getattr(self, "_gesture_active_label", "") or "")
+        if builtin:
+            return f"手势：{builtin}"
+        raw = str(getattr(self, "_hand_status_text", "") or "")
+        if not raw:
+            return "手部：未检测到"
+        if raw.startswith("手部："):
+            return raw
+        # 手在画面、但还没触发任何手势：这是手型识别的原始结果，标明「手型」，
+        # 免得又被读成「系统认为你做的手势是握拳」。
+        return f"手型：{raw}"
+
+    def _refresh_hands_status(self) -> None:
+        """重画「手部驱动」卡片里那一行状态（找不到识别模型时给的是安装提示）。"""
+        label = getattr(self, "hands_status_label", None)
+        if label is None:
+            return
+        capture = getattr(self, "motion_capture", None)
+        getter = getattr(capture, "gesture_available", None)
+        available = True
+        if getter is not None:
+            try:
+                available = bool(getter())
+            except Exception:
+                available = True
+        if not available:
+            label.setText("未找到 hand_landmarker.task，手势识别不可用（放到 client-python/models/ 下）")
+            return
+        label.setText(self._hands_status_line())
+
+    def _refresh_gesture_status(self) -> None:
+        """刷新「识别手势」那一行：内置手型与自定义姿势手势各报各的。
+
+        两条链路是独立的（手型和手臂姿势可以同时成立），所以这里两个都显示，
+        用户能一眼看出到底是哪条在触发——调试自己的自定义手势时这是最关键的
+        信息。
+        """
+        label = getattr(self, "gesture_value_label", None)
+        if label is not None:
+            parts: list[str] = []
+            builtin = getattr(self, "_gesture_active_label", "")
+            if builtin:
+                parts.append(builtin)
+            pose_name = self._pose_gesture_display_name()
+            if pose_name:
+                parts.append(f"手势：{pose_name}")
+            label.setText("　".join(parts) if parts else "—")
+        # 操作区那一行也跟着走：自定义手势命中 / 解除都要立刻反映出来
+        self._refresh_hands_status()
+
+    def _on_hands_status_changed(self, text: str) -> None:
+        # 动捕线程给的只是**手型**链路的结论，先存下来，再由 :meth:`_hands_status_line`
+        # 和自定义手势名合成后写进标签。
+        self._hand_status_text = str(text or "")
+        self._refresh_hands_status()
+
+    def _on_gesture_changed(self, side: str, gesture: str) -> None:
+        """某一侧手的手势变为稳定状态（或解除）时触发对应动作。"""
+        who = "左手" if side == "l" else "右手"
+        self._gesture_active_label = f"{who} {gesture_name(gesture)}" if gesture else ""
+        self._refresh_gesture_status()
+        if not gesture:
+            return
+        self._trigger_gesture_action(self._action_for_gesture(gesture))
+
+    def _trigger_gesture_action(self, action: str | None) -> None:
+        """执行手势绑定的动作。
+
+        动作 id 由菜单给出（``motion:<真名>`` / ``expression:<真名>``），触发时
+        直接拿这个名字去调模型，不再靠候选名猜测；老配置里写死的
+        ``wave`` / ``expression_smile`` 也仍然解析得了（见 ``split_action``）。
+        """
+        if not action or action == model_actions.ACTION_NONE:
+            return
+        view = self._active_model_view()
+        if view is None:
+            return
+        caps = self._capabilities_from_menu(self._available_actions())
+        resolved = model_actions.resolve_action(action, caps)
+        if resolved is None:
+            return
+        kind, name = resolved
+        if kind == "expression":
+            self._set_model_expression(name)
+            return
+        try:
+            view.play_motion(name)
+        except Exception:
+            pass
+
+    def _set_model_expression(self, name: str) -> None:
+        """设置表情，几秒后自动复原；模型没有该表情时退化为播放动作。"""
+        view = self._active_model_view()
+        setter = getattr(view, "set_expression", None)
+        if view is None or setter is None:
+            return
+        ok = False
+        try:
+            ok = bool(setter(name))
+        except Exception:
+            ok = False
+        if not ok:
+            # 表情真设不上（模型没这个表情）就退一步播个动作，
+            # 总比手势过去了模型一动不动强。
+            caps = self._capabilities_from_menu(self._available_actions())
+            if caps.motions:
+                try:
+                    view.play_motion(caps.motions[0])
+                except Exception:
+                    pass
+            return
+        self._gesture_expression["kind"] = name
+        timer = getattr(self, "_gesture_expression_timer", None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self._clear_model_expression)
+            self._gesture_expression_timer = timer
+        timer.start(3000)
+
+    def _clear_model_expression(self) -> None:
+        self._gesture_expression["kind"] = ""
+        view = self._active_model_view()
+        if view is not None and hasattr(view, "clear_expression"):
+            try:
+                view.clear_expression()
+            except Exception:
+                pass
+
     def _on_motion_start(self) -> None:
         self._apply_motion_settings()
         self._avatar_running_before_capture = getattr(self, "_avatar_running", False)
         if self.motion_capture.start():
-            self.motion_start_button.hide()
-            self.motion_stop_button.show()
-            home_start = getattr(self, "home_motion_start_button", None)
-            if home_start is not None:
-                home_start.hide()
-            home_stop = getattr(self, "home_motion_stop_button", None)
-            if home_stop is not None:
-                home_stop.show()
             self._motion_running = True
             self._reset_motion_preview("正在启动摄像头…")
             home_stack = getattr(self, "home_motion_stack", None)
@@ -1487,18 +2435,12 @@ class HomeWindow(QMainWindow):
             if getattr(self, "live2d_view", None) is not None:
                 self.live2d_view.set_auto_features(blink=False, breath=True)
                 self.live2d_view.stop_motions()
+            # 放在 _avatar_running 置位**之后**：四个入口（含虚拟形象页）要一起重画
+            self._refresh_runtime_controls()
 
     def _on_motion_stop(self) -> None:
         self.motion_capture.stop()
         self._motion_running = False
-        self.motion_start_button.show()
-        self.motion_stop_button.hide()
-        home_start = getattr(self, "home_motion_start_button", None)
-        if home_start is not None:
-            home_start.show()
-        home_stop = getattr(self, "home_motion_stop_button", None)
-        if home_stop is not None:
-            home_stop.hide()
         home_stack = getattr(self, "home_motion_stack", None)
         if home_stack is not None:
             home_stack.setCurrentIndex(0)
@@ -1513,6 +2455,61 @@ class HomeWindow(QMainWindow):
             self.live2d_view.set_auto_features(blink=True, breath=True)
             self.live2d_view.reset_drive()
             self.live2d_view.start_idle()
+        self._refresh_runtime_controls()
+
+    def _refresh_runtime_controls(self) -> None:
+        """把「动捕 / 形象」的启停入口按当前状态**整体重画**一遍。
+
+        同一件事在**四个地方**都有入口，每个入口还各有自己的开始/停止按钮、
+        状态文字和两态容器：
+
+        * 视频动捕页：``motion_start_button`` / ``motion_stop_button``
+        * 首页「动捕控制」卡：``home_motion_start_button`` / ``home_motion_stop_button``
+        * 首页「虚拟形象预览」：``home_preview_start_button`` / ``home_preview_stop_button``
+          —— 这两者靠 ``home_preview_stack`` 在「模型列表」与「画面」之间切换
+        * 虚拟形象页：``avatar_start_button`` / ``avatar_stop_button``
+
+        以前是**谁触发谁只改自己那一处**，于是「在动捕页开始动捕、切到虚拟形象页，
+        按钮还停留在『启动』」——模型其实已经在跑了（``_avatar_running`` 早就是
+        True），只是那几行字没人负责更新。现在统一按 ``_motion_running`` /
+        ``_avatar_running`` 两个标志重画，**任何一处改了标志都调它**，切页时也调。
+
+        状态文字各自带模型名（「已启动：XXX」），不适合在这里统一，仍由各自的
+        方法写；这里只管按钮显隐、两态容器和列表里的「[使用中]」。
+        """
+        motion_running = bool(getattr(self, "_motion_running", False))
+        avatar_running = bool(getattr(self, "_avatar_running", False))
+
+        for start_attr, stop_attr in (
+            ("motion_start_button", "motion_stop_button"),
+            ("home_motion_start_button", "home_motion_stop_button"),
+        ):
+            start = getattr(self, start_attr, None)
+            if start is not None:
+                start.setVisible(not motion_running)
+            stop = getattr(self, stop_attr, None)
+            if stop is not None:
+                stop.setVisible(motion_running)
+
+        avatar_start = getattr(self, "avatar_start_button", None)
+        if avatar_start is not None:
+            avatar_start.setVisible(not avatar_running)
+        avatar_stop = getattr(self, "avatar_stop_button", None)
+        if avatar_stop is not None:
+            avatar_stop.setVisible(avatar_running)
+
+        # 首页形象预览：未启动看模型列表（含「启动预览」），启动后看画面（含「停止」）
+        home_stack = getattr(self, "home_preview_stack", None)
+        if home_stack is not None:
+            home_stack.setCurrentIndex(1 if avatar_running else 0)
+
+        # 模型列表里的「[使用中]」同样吃 _avatar_running，不刷它就一直不出现
+        for refresh in (self._refresh_avatar_model_list, self._refresh_home_model_list):
+            try:
+                refresh()
+            except Exception:
+                # 页面还没建好 / 自检里只搭了部分属性，刷新不到就跳过
+                pass
 
     def _on_motion_frame(self, image) -> None:
         if not getattr(self, "_motion_running", False):
@@ -1544,6 +2541,12 @@ class HomeWindow(QMainWindow):
             label.setText(text)
 
     def _on_motion_drive(self, drive: dict) -> None:
+        # 语音驱动口型启用时，嘴型以声音包络为准，覆盖摄像头给出的 jawOpen，
+        # 否则「看画面」和「听声音」两路会互相打架。
+        if self._voice_lipsync.is_enabled():
+            mouth, form, _level = self._voice_lipsync.read()
+            drive["mouth_open"] = mouth
+            drive["mouth_form"] = form
         # 根据当前模型类型传递动捕数据
         model_type = self._current_avatar_kind()
         
@@ -2142,6 +3145,8 @@ class HomeWindow(QMainWindow):
         if ok:
             self._sync_preview_views()
             self._refresh_drive_params_card()
+            # 换模型了，手势菜单要按新模型支持的动作 / 表情重建
+            self._rebuild_gesture_menus()
 
     def _on_live2d_error(self, message: str) -> None:
         text = f"模型加载失败：{message}"
@@ -2162,6 +3167,7 @@ class HomeWindow(QMainWindow):
         if ok:
             self._sync_preview_views()
             self._refresh_drive_params_card()
+            self._rebuild_gesture_menus()
 
     def _on_vrm_error(self, message: str) -> None:
         text = f"VRM模型加载失败：{message}"
@@ -2248,11 +3254,13 @@ class HomeWindow(QMainWindow):
             self._refresh_model_list("vrm")
 
         self._sync_preview_views()
-        self.avatar_status.setText(f"已启动：{name}")
-        if hasattr(self, "avatar_start_button"):
-            self.avatar_start_button.hide()
-        if hasattr(self, "avatar_stop_button"):
-            self.avatar_stop_button.show()
+        # 两个页面的状态文字一起写（以前只写形象页，首页那份一直停在旧文字）
+        for attr in ("home_avatar_status", "avatar_status"):
+            label = getattr(self, attr, None)
+            if label is not None:
+                label.setText(f"已启动：{name}")
+        # 首页预览切到画面那一态、两处模型列表的「[使用中]」一起刷新
+        self._refresh_runtime_controls()
 
     def _stop_avatar(self) -> None:
         """停止模型预览，清除视图并隐藏，不再一直显示。"""
@@ -2273,10 +3281,7 @@ class HomeWindow(QMainWindow):
             label = getattr(self, attr, None)
             if label is not None:
                 label.setText("已停止")
-        if hasattr(self, "avatar_start_button"):
-            self.avatar_start_button.show()
-        if hasattr(self, "avatar_stop_button"):
-            self.avatar_stop_button.hide()
+        self._refresh_runtime_controls()
 
     def _reload_live2d(self) -> None:
         if not getattr(self, "_avatar_running", False):
@@ -2299,11 +3304,14 @@ class HomeWindow(QMainWindow):
         self._refresh_avatar_model_list()
         self._sync_preview_views()
         self._refresh_drive_params_card()
+        # 换了模型类型就是换了模型，手势菜单得跟着换一套
+        self._rebuild_gesture_menus()
 
     def _on_home_type_changed(self, index: int) -> None:
         """首页模型类型左右标签切换回调"""
         self._avatar_kind = "live2d" if index <= 0 else "vrm"
         self._refresh_home_model_list()
+        self._rebuild_gesture_menus()
         if getattr(self, "_avatar_running", False):
             active = (
                 self._active_live2d_entry()
@@ -2361,10 +3369,14 @@ class HomeWindow(QMainWindow):
         self._avatar_running = True
         self._refresh_home_model_list()
         self._refresh_model_list(kind)
-        self.home_preview_stack.setCurrentIndex(1)
         self.home_current_model_label.setText(name)
-        self.home_avatar_status.setText(f"已启动：{name}")
+        # 两个页面的状态文字一起写；栈与按钮显隐交给 _refresh_runtime_controls
+        for attr in ("home_avatar_status", "avatar_status"):
+            label = getattr(self, attr, None)
+            if label is not None:
+                label.setText(f"已启动：{name}")
         self._sync_preview_views()
+        self._refresh_runtime_controls()
 
     def _on_home_preview_stop(self) -> None:
         self._avatar_running = False
@@ -2376,11 +3388,14 @@ class HomeWindow(QMainWindow):
                     view.clear_model()
                 except Exception:
                     pass
-        self.home_preview_stack.setCurrentIndex(0)
         self.home_current_model_label.setText("--")
-        self.home_avatar_status.setText("已停止")
+        for attr in ("home_avatar_status", "avatar_status"):
+            label = getattr(self, attr, None)
+            if label is not None:
+                label.setText("已停止")
         self._refresh_home_model_list()
         self._sync_preview_views()
+        self._refresh_runtime_controls()
 
     def _on_home_prev_model(self) -> None:
         self._cycle_home_model(-1)
@@ -2756,6 +3771,33 @@ class HomeWindow(QMainWindow):
         box.addLayout(bars, 1)
         return meter
 
+    # ------------------------------------------------------------------
+    # 调音台（独立弹窗，见 app/ui/mixer_dialog.py）
+    # ------------------------------------------------------------------
+
+    def _on_mixer_clicked(self) -> None:
+        dlg = getattr(self, "_mixer_dialog", None)
+        if dlg is not None and dlg.isVisible():
+            dlg.raise_()
+            dlg.activateWindow()
+            return
+        try:
+            from app.ui.mixer_dialog import MixerDialog
+        except ImportError as e:
+            show_info(self, "星弦", f"调音台不可用：{e}")
+            return
+        dlg = MixerDialog(self, self.settings_store)
+        dlg.finished.connect(lambda _=0: setattr(self, "_mixer_dialog", None))
+        self._mixer_dialog = dlg
+        dlg.show()
+
+    def _shutdown_mixer(self) -> None:
+        dlg = getattr(self, "_mixer_dialog", None)
+        if dlg is not None:
+            dlg.shutdown_monitor()
+            dlg.close()
+            self._mixer_dialog = None
+
     def _on_avatar_live2d_loaded(self, ok: bool) -> None:
         """Live2D 模型加载成功回调"""
         active = self._active_live2d_entry()
@@ -2779,6 +3821,7 @@ class HomeWindow(QMainWindow):
         if ok:
             self._sync_preview_views()
             self._refresh_drive_params_card()
+            self._rebuild_gesture_menus()
 
     def _on_avatar_vrm_error(self, message: str) -> None:
         """VRM 模型加载失败回调"""
@@ -3353,6 +4396,131 @@ class HomeWindow(QMainWindow):
         layout.addLayout(save_row)
         return page
 
+    def _build_lipsync_card(self) -> QFrame:
+        """语音驱动口型控制卡：让嘴型跟着声音走，而不是跟着摄像头画面走。"""
+        card, box = _make_card("语音驱动口型")
+        hint = QLabel(
+            "从变声链路的输入电平提取包络驱动嘴型，说话即张嘴、停顿即收口；"
+            "需要先启动变声。"
+        )
+        hint.setObjectName("hintText")
+        hint.setWordWrap(True)
+        box.addWidget(hint)
+
+        self.lipsync_toggle = QCheckBox("启用语音驱动口型")
+        self.lipsync_toggle.setObjectName("toggle")
+        self.lipsync_toggle.setChecked(bool(self.lipsync_settings.get("enabled", False)))
+        self.lipsync_toggle.toggled.connect(self._on_lipsync_toggled)
+        box.addWidget(self.lipsync_toggle)
+
+        self.lipsync_form_toggle = QCheckBox("同时驱动口型形状")
+        self.lipsync_form_toggle.setObjectName("toggle")
+        self.lipsync_form_toggle.setChecked(bool(self.lipsync_settings.get("form_enabled", True)))
+        self.lipsync_form_toggle.setToolTip("按频谱亮度区分扁口与圆唇，模型需支持嘴巴形状参数")
+        self.lipsync_form_toggle.toggled.connect(self._on_lipsync_form_toggled)
+        box.addWidget(self.lipsync_form_toggle)
+
+        gain_row = QHBoxLayout()
+        gain_row.setSpacing(8)
+        gain_row.addWidget(self._form_label("灵敏度"))
+        self.lipsync_gain_slider = QSlider(Qt.Orientation.Horizontal)
+        self.lipsync_gain_slider.setObjectName("rvcSlider")
+        self.lipsync_gain_slider.setRange(50, 300)  # 0.50 ~ 3.00
+        self.lipsync_gain_slider.setValue(
+            int(round(float(self.lipsync_settings.get("gain", 1.4)) * 100))
+        )
+        self.lipsync_gain_slider.valueChanged.connect(self._on_lipsync_gain_changed)
+        gain_row.addWidget(self.lipsync_gain_slider, 1)
+        self.lipsync_gain_value = QLabel(f"{self.lipsync_gain_slider.value() / 100:.2f}")
+        self.lipsync_gain_value.setObjectName("infoValue")
+        self.lipsync_gain_value.setFixedWidth(40)
+        self.lipsync_gain_value.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        gain_row.addWidget(self.lipsync_gain_value)
+        box.addLayout(gain_row)
+
+        self.lipsync_meter = QProgressBar()
+        self.lipsync_meter.setObjectName("volumeBar")
+        self.lipsync_meter.setRange(0, 100)
+        self.lipsync_meter.setValue(0)
+        self.lipsync_meter.setTextVisible(False)
+        self.lipsync_meter.setFixedHeight(14)
+        box.addWidget(self.lipsync_meter)
+
+        self.lipsync_status = QLabel("未启用")
+        self.lipsync_status.setObjectName("hintText")
+        self.lipsync_status.setWordWrap(True)
+        box.addWidget(self.lipsync_status)
+        return card
+
+    def _set_lipsync_controls(self, enabled: bool) -> None:
+        for attr in ("lipsync_gain_slider", "lipsync_form_toggle"):
+            widget = getattr(self, attr, None)
+            if widget is not None:
+                widget.setEnabled(bool(enabled))
+
+    def _on_lipsync_toggled(self, checked: bool) -> None:
+        self.lipsync_settings["enabled"] = bool(checked)
+        self._voice_lipsync.set_enabled(bool(checked))
+        if checked:
+            self._lipsync_timer.start()
+            self.lipsync_status.setText("已启用：启动变声后说话即可看到口型")
+        else:
+            self._lipsync_timer.stop()
+            self._voice_lipsync.reset()
+            if getattr(self, "lipsync_meter", None) is not None:
+                self.lipsync_meter.setValue(0)
+            self.lipsync_status.setText("未启用")
+        self._set_lipsync_controls(checked)
+        self._save_lipsync_settings()
+
+    def _on_lipsync_form_toggled(self, checked: bool) -> None:
+        self.lipsync_settings["form_enabled"] = bool(checked)
+        self._save_lipsync_settings()
+
+    def _on_lipsync_gain_changed(self, value: int) -> None:
+        gain = value / 100.0
+        self.lipsync_settings["gain"] = gain
+        self._voice_lipsync.set_gain(gain)
+        if getattr(self, "lipsync_gain_value", None) is not None:
+            self.lipsync_gain_value.setText(f"{gain:.2f}")
+        self._save_lipsync_settings()
+
+    def _save_lipsync_settings(self) -> None:
+        try:
+            self.settings_store.save_lipsync(self.lipsync_settings)
+        except Exception as error:  # noqa: BLE001
+            print(f"保存语音口型设置失败: {error}")
+
+    def _on_lipsync_tick(self) -> None:
+        """把语音包络写进当前显示中的模型视图。
+
+        只写嘴部参数，不整帧下发 ``apply_drive``，否则会把动捕正在驱动的
+        头部/手臂一起归零。
+        """
+        if not self._voice_lipsync.is_enabled():
+            return
+        mouth, form, level = self._voice_lipsync.read()
+        if getattr(self, "lipsync_meter", None) is not None:
+            self.lipsync_meter.setValue(int(max(0.0, min(1.0, level)) * 100))
+        if mouth <= 0.01 and not getattr(self, "_lipsync_was_active", False):
+            return
+        self._lipsync_was_active = mouth > 0.01
+        view = self._active_model_view()
+        if view is None:
+            return
+        shape = form if self.lipsync_settings.get("form_enabled", True) else None
+        try:
+            view.set_mouth(mouth, shape)
+        except Exception:
+            pass
+
+    def _active_model_view(self):
+        """返回当前页面/模型类型下真正在显示的那个模型视图。"""
+        kind = self._current_avatar_kind()
+        if kind == "vrm":
+            return getattr(self, "avatar_vrm_view", None)
+        return getattr(self, "live2d_view", None)
+
     def _build_rvc_page(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
@@ -3452,7 +4620,7 @@ class HomeWindow(QMainWindow):
         combo_form.addWidget(self._form_label("音高提取方法"), 0, 0)
         self.rvc_f0_method = ArrowComboBox()
         self.rvc_f0_method.setObjectName("inputBox")
-        self.rvc_f0_method.addItems(["rmvpe", "crepe", "harvest", "mangio-crepe"])
+        self.rvc_f0_method.addItems(["rmvpe", "crepe", "harvest", "pm", "mangio-crepe"])
         self.rvc_f0_method.setCurrentText("rmvpe")
         combo_form.addWidget(self.rvc_f0_method, 0, 1)
 
@@ -3553,10 +4721,17 @@ class HomeWindow(QMainWindow):
         self.rvc_stop_button.hide()  # 未开始变声只显示“开始变声”
         control_buttons.addWidget(self.rvc_start_button)
         control_buttons.addWidget(self.rvc_stop_button)
+        self.rvc_mixer_button = QPushButton("调音台")
+        self.rvc_mixer_button.setObjectName("ghostButton")
+        self.rvc_mixer_button.clicked.connect(self._on_mixer_clicked)
+        control_buttons.addWidget(self.rvc_mixer_button)
         control_buttons.addStretch()
         right_layout.addLayout(control_buttons)
 
-        # 变声控制下方：竖向音量监听
+        # 变声控制下方：语音驱动口型
+        right_layout.addWidget(self._build_lipsync_card())
+
+        # 变声控制下方：竖向音量监听（调音台为独立弹窗）
         right_layout.addSpacing(10)
         self.rvc_volume_meter = self._build_vertical_meter("rvc")
         right_layout.addWidget(self.rvc_volume_meter)
@@ -4010,8 +5185,11 @@ class HomeWindow(QMainWindow):
         self._save_motion_settings()
         self._save_system_settings()
         self.motion_capture.set_drive_params(motion.get("params", {}))
+        self.motion_capture.set_hand_enabled(bool(motion.get("hand_enabled", True)))
+        self.motion_capture.set_gesture_enabled(bool(motion.get("gesture_enabled", True)))
         self._refresh_drive_params_card()
         self._refresh_system_settings_view()
+        self._refresh_gesture_ui()
         self._sync_camera_combos()
 
     def _delete_cloud_preset(self) -> None:
@@ -4295,10 +5473,13 @@ class HomeWindow(QMainWindow):
         self._rvc_gate_threshold = gate
 
         # 下拉框
-        f0_method = rvc.get("f0_method", "rmvpe")
-        # harvest 在 CPU 实时场景过慢（转换跟不上会丢字/卡顿），自动切到更快的 rmvpe
-        if f0_method == "harvest":
-            f0_method = "rmvpe"
+        f0_method = rvc.get("f0_method", "pm")
+        # harvest 在实时场景过慢（转换跟不上会丢字/卡顿）；rmvpe/crepe 依赖
+        # 未安装时会静默回退，这里统一映射到当前环境可用且快的 pm
+        if f0_method in ("harvest", "rmvpe", "crepe", "mangio-crepe", "fcpe"):
+            from app.services.rvc_service import f0_method_available
+            if not f0_method_available(f0_method):
+                f0_method = "pm"
         idx = self.rvc_f0_method.findText(f0_method)
         if idx >= 0:
             self.rvc_f0_method.setCurrentIndex(idx)
@@ -4683,7 +5864,7 @@ class HomeWindow(QMainWindow):
         model_path: str = "",
         index_path: str | None = None,
         pitch_shift: int = 0,
-        f0_method: str = "rmvpe",
+        f0_method: str = "pm",
         index_rate: float = 0.75,
         filter_radius: int = 3,
         rms_mix_rate: float = 0.25,
@@ -4719,6 +5900,9 @@ class HomeWindow(QMainWindow):
     def _stop_audio_processing(self) -> None:
         """停止音频处理"""
         self._rvc_running = False
+        # 音频流停了就不会再有新的包络输入，先收口避免嘴一直张着
+        if getattr(self, "_voice_lipsync", None) is not None:
+            self._voice_lipsync.reset()
         if hasattr(self, '_rvc_audio_thread') and self._rvc_audio_thread is not None:
             self._rvc_audio_thread.join(timeout=3.0)
             self._rvc_audio_thread = None
@@ -4730,7 +5914,7 @@ class HomeWindow(QMainWindow):
         model_path: str = "",
         index_path: str | None = None,
         pitch_shift: int = 0,
-        f0_method: str = "rmvpe",
+        f0_method: str = "pm",
         index_rate: float = 0.75,
         filter_radius: int = 3,
         rms_mix_rate: float = 0.25,
@@ -4743,29 +5927,41 @@ class HomeWindow(QMainWindow):
         try:
             import sounddevice as sd
 
-            # 初始化RVC引擎
-            engine = RVCEngine()
-            self._noise_floor = None
+            # 引擎复用：上次因设备/流问题启动失败后再次点击，不再重新加载模型
+            use_half = bool(is_half)
             try:
-                # CPU 上不做半精度：又慢又容易产生杂音/失真
-                use_half = bool(is_half)
-                try:
-                    import torch
+                import torch
 
-                    use_half = use_half and torch.cuda.is_available()
-                except Exception:
-                    use_half = False
-                engine.load_model(
-                    model_path=model_path,
-                    index_path=index_path,
-                    is_half=use_half,
-                )
-            except Exception as e:
-                print(f"RVC模型加载失败: {e}")
-                self.rvc_status_changed.emit("状态：模型加载失败", False)
-                return
+                # CPU 上不做半精度：又慢又容易产生杂音/失真
+                use_half = use_half and torch.cuda.is_available()
+            except Exception:
+                use_half = False
+            cache_key = (model_path, index_path or "", use_half)
+            engine = getattr(self, "_rvc_engine", None)
+            if engine is None or getattr(self, "_rvc_engine_key", None) != cache_key:
+                engine = RVCEngine()
+                try:
+                    engine.load_model(
+                        model_path=model_path,
+                        index_path=index_path,
+                        is_half=use_half,
+                    )
+                except Exception as e:
+                    print(f"RVC模型加载失败: {e}")
+                    self.rvc_status_changed.emit("状态：模型加载失败", False)
+                    return
+                self._rvc_engine = engine
+                self._rvc_engine_key = cache_key
+            self._noise_floor = None
 
             sample_rate = engine.sample_rate
+            # 设备可能已被拔出/禁用：建流前校验索引，失效则回退系统默认设备
+            input_device_idx = self._resolve_device_index(
+                sd, input_device_idx, "input"
+            )
+            output_device_idx = self._resolve_device_index(
+                sd, output_device_idx, "output"
+            )
             stream_rate = self._pick_stream_rate(
                 sd, input_device_idx, output_device_idx, sample_rate
             )
@@ -4893,6 +6089,9 @@ class HomeWindow(QMainWindow):
                     volumes["in"] = min(int(np.sqrt(np.mean(audio_in ** 2)) * 100), 100)
                 except Exception:
                     volumes["in"] = 0
+                # 语音驱动口型：直接用输入电平取包络，与变声链路是否被门限
+                # 静音无关，说话就张嘴、停下就收口
+                self._voice_lipsync.feed(audio_in, stream_rate)
                 threshold = int(getattr(self, "_rvc_gate_threshold", 0) or 0)
                 if threshold <= 0 or volumes["in"] >= threshold:
                     gate["target"] = 1.0
@@ -4910,6 +6109,21 @@ class HomeWindow(QMainWindow):
                         self._resample_audio(audio_in, stream_rate, sample_rate)
                     )
                 self._update_volume_display(volumes["in"], volumes["out"])
+
+            def mixer_output_gain() -> float:
+                """调音台弹窗打开时，按实际输出设备查询通道增益/静音。"""
+                dlg = getattr(self, "_mixer_dialog", None)
+                if dlg is None:
+                    return 1.0
+                try:
+                    name = ""
+                    try:
+                        name = str(sd.query_devices(output_stream.device)["name"])
+                    except Exception:
+                        name = str(sd.query_devices(output_device_idx)["name"])
+                    return float(dlg.current_output_gain(name))
+                except Exception:
+                    return 1.0
 
             def output_callback(outdata, frames, time_info, status):
                 if status:
@@ -4930,8 +6144,8 @@ class HomeWindow(QMainWindow):
                 gain0 = gate["gain"]
                 target = gate["target"]
                 step = 0.45 if target > gain0 else 0.15
-                gain1 = gain0 + (target - gain0) * step
-                ramp = np.linspace(gain0, gain1, frames, dtype=np.float32)
+                gain1 = (gain0 + (target - gain0) * step) * mixer_output_gain()
+                ramp = np.linspace(gain0 * mixer_output_gain(), gain1, frames, dtype=np.float32)
                 if out_len >= frames:
                     outdata[:, 0] = audio_out[:frames] * ramp
                 else:
@@ -4949,16 +6163,20 @@ class HomeWindow(QMainWindow):
                 output_q.put(np.zeros(hop, dtype=np.float32))
 
             # 输入/输出分开建流：避免不同设备无法组成全双工流（PaErrorCode -9993）
-            input_stream = sd.InputStream(
-                device=input_device_idx,
+            input_stream = self._open_stream(
+                sd,
+                sd.InputStream,
+                input_device_idx,
                 channels=1,
                 samplerate=stream_rate,
                 blocksize=stream_chunk,
                 dtype="float32",
                 callback=input_callback,
             )
-            output_stream = sd.OutputStream(
-                device=output_device_idx,
+            output_stream = self._open_stream(
+                sd,
+                sd.OutputStream,
+                output_device_idx,
                 channels=1,
                 samplerate=stream_rate,
                 blocksize=stream_chunk,
@@ -4983,6 +6201,79 @@ class HomeWindow(QMainWindow):
         except Exception as e:
             print(f"音频处理错误: {str(e)}")
             self.rvc_status_changed.emit(f"状态：音频流启动失败：{str(e)[:80]}", False)
+
+    @staticmethod
+    def _resolve_device_index(sd, idx, kind: str):
+        """校验设备索引是否仍然有效；失效时回退到系统默认设备。
+
+        设备下拉框里的索引可能是旧快照（设备已拔出/禁用/虚拟声卡卸载），
+        直接传给 PortAudio 会得到 Invalid device(-9996) 甚至 host error(-9999)。
+        """
+        def _valid(i) -> bool:
+            try:
+                info = sd.query_devices(i)
+            except Exception:
+                return False
+            return bool(info.get(f"max_{kind}_channels", 0))
+
+        if _valid(idx):
+            return idx
+        try:
+            defaults = sd.query_devices(kind=kind)
+            default_idx = int(defaults["index"])
+            if _valid(default_idx):
+                print(f"RVC: {kind} 设备 {idx!r} 已失效，回退默认设备 {default_idx} ({defaults.get('name')})")
+                return default_idx
+        except Exception:
+            pass
+        # 最后手段：扫描第一个支持该方向的设备
+        try:
+            for i, info in enumerate(sd.query_devices()):
+                if _valid(i):
+                    print(f"RVC: {kind} 设备 {idx!r} 失效，改用设备 {i} ({info.get('name')})")
+                    return i
+        except Exception:
+            pass
+        return idx
+
+    @staticmethod
+    def _open_stream(sd, stream_cls, dev_idx: int, **kw):
+        """打开音频流，失败时逐级回退。
+
+        Windows 上同一物理设备会同时出现在 MME / DirectSound / WASAPI 等接口下，
+        MME 报 -9999 host error（蓝牙耳机、虚拟声卡常见）时 WASAPI 往往正常；
+        设备被拔出/禁用则索引直接 -9996 invalid device。
+        顺序：原索引 → 同名/前缀匹配的其他接口条目（优先 WASAPI）→ 系统默认设备。
+        注意 MME 设备名会被截断到 31 字符，因此用前缀匹配。
+        """
+        attempts: list[int] = []
+        try:
+            if dev_idx is not None and dev_idx >= 0:
+                attempts.append(int(dev_idx))
+                name = str(sd.query_devices(int(dev_idx)).get("name", ""))[:24]
+                if name:
+                    ranked = []
+                    for i, info in enumerate(sd.query_devices()):
+                        if i in attempts:
+                            continue
+                        if str(info.get("name", ""))[:24] == name:
+                            # WASAPI（通常排在后、独占共享混合模式最稳）优先尝试
+                            ranked.append((1, i))
+                        else:
+                            continue
+                    attempts.extend(i for _, i in sorted(ranked, key=lambda t: -t[1]))
+        except Exception:
+            pass
+        attempts.append(-1)  # 系统默认设备
+        last_err: Exception | None = None
+        for cand in attempts:
+            try:
+                return stream_cls(device=None if cand == -1 else cand, **kw)
+            except Exception as err:
+                last_err = err
+                print(f"RVC: 音频设备 {cand} 打开失败({err})，尝试回退…")
+                continue
+        raise last_err
 
     @staticmethod
     def _pick_stream_rate(sd, input_device_idx, output_device_idx, preferred: int) -> int:
