@@ -428,6 +428,47 @@ class MixerDialog(QDialog):
         self._rebuild_grid()
         self._persist()
 
+    @staticmethod
+    def _norm_name(name: str) -> str:
+        """设备名归一化：小写、去掉 [Loopback] 标记和空白，方便跨枚举源匹配。"""
+        s = str(name or "").lower()
+        for token in ("[loopback]", "(loopback)", "（loopback）"):
+            s = s.replace(token, "")
+        return "".join(s.split())
+
+    def channel_count(self) -> int:
+        return len(self._columns)
+
+    def ensure_default_channels(self, preferred_names: list) -> None:
+        """第一次打开（没有任何已存通道）时，把变声正在用的设备自动加为监控。
+
+        不加的话调音台打开是一片空白，用户会以为「实时音量没有」——其实只是
+        还没有任何监控通道。匹配不上就不加，仍然走手动「＋ 添加音频源」；
+        匹配顺序：归一化后相等 → 互相包含（兼容回环名里的 [Loopback] 后缀）。
+        """
+        if self._columns:
+            return
+        try:
+            devices = self._all_devices()
+        except Exception:
+            return
+        taken: set[int] = set()
+        for want_name in preferred_names:
+            want = self._norm_name(want_name)
+            if not want:
+                continue
+            device = None
+            for d in devices:
+                if d.index in taken:
+                    continue
+                got = self._norm_name(d.name)
+                if got == want or want in got or got in want:
+                    device = d
+                    break
+            if device is not None:
+                taken.add(device.index)
+                self._add_channel(device)
+
     # ------------------------------------------------------------------
     # 采集与电平
     # ------------------------------------------------------------------

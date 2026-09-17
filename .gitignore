@@ -29,6 +29,10 @@ tools/
 *.pth
 *.pth.qkdownloading
 
+# RVC / HuBERT 大模型（单文件 >100MB，超过 GitHub 限制，运行时按需下载）
+client-python/assets/*.pt
+client-python/assets/hubert_base/*.bin
+
 # VRM 模型文件
 *.vrm
 

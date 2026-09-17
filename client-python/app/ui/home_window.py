@@ -997,6 +997,7 @@ class HomeWindow(QMainWindow):
         # 切页时按当前状态重画一遍启停入口：别处已经启动的动捕 / 形象，在这一页
         # 的按钮上也得是「已启动」的样子（用户报的就是切到形象页停在「启动」）
         self._refresh_runtime_controls()
+        self._refresh_volume_meter_device_labels()
         self.nav_group.setExclusive(False)
         for button in self.nav_group.buttons():
             button.setChecked(False)
@@ -3724,16 +3725,49 @@ class HomeWindow(QMainWindow):
         combo.setMaximumWidth(max_width)
         combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
+    @staticmethod
+    def _make_scroll_column(panel: QFrame) -> "QVBoxLayout":
+        """把面板内容放进可滚动区，返回内容实际要用的那个 ``QVBoxLayout``。
+
+        变声页左右两栏的控件都不止几个（参数滑条 / 设备区 / 口型卡 / 音量监控），
+        窗口高度不够时普通 ``QVBoxLayout`` 会把每一项压到 sizeHint 以下，表现就是
+        「上面的设置文字被挤没了」。滚动区让每一项都拿回自己的自然高度。
+        """
+        outer = QVBoxLayout(panel)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        # QScrollArea 的 viewport 默认白底，会把整块深色主题盖成白色；
+        # `> QWidget > QWidget` 选中的是 widgetResizable 塞进来的内容宿主。
+        scroll.setStyleSheet(
+            "QScrollArea, QScrollArea > QWidget > QWidget { background: transparent; }"
+        )
+        host = QWidget()
+        layout = QVBoxLayout(host)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(12)
+        scroll.setWidget(host)
+        outer.addWidget(scroll)
+        return layout
+
     def _build_vertical_meter(self, prefix: str, compact: bool = False) -> QFrame:
-        """构建竖向音量监听表，并把进度条/数值挂到 self.<prefix>_* 上。"""
+        """构建竖向音量监听表，并把进度条/数值挂到 self.<prefix>_* 上。
+
+        每一列 = 电平柱 + **大号实时百分比** + **当前监控的设备名**（+ 类型小字）。
+        以前只有「输入 / 输出」两个字的静态标签、柱子又细，用户反馈「调音台下面
+        这是什么 ui 都看不见」「监控每个设备的音量功能也是要有的」——所以现在
+        设备名由 :meth:`_refresh_volume_meter_device_labels` 跟着设备选择实时更新，
+        监控的是哪个设备一眼可见。
+        """
         meter = QFrame()
         meter.setObjectName("panel")
         if compact:
-            meter.setFixedHeight(146)
-            bar_width, bar_height = 22, 68
+            meter.setFixedHeight(176)
+            bar_width, bar_height = 30, 84
         else:
-            meter.setFixedHeight(196)
-            bar_width, bar_height = 30, 100
+            meter.setFixedHeight(228)
+            bar_width, bar_height = 44, 132
         meter.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         box = QVBoxLayout(meter)
         box.setContentsMargins(14, 10, 14, 10)
@@ -3742,9 +3776,9 @@ class HomeWindow(QMainWindow):
         title.setObjectName("panelTitle")
         box.addWidget(title)
         bars = QHBoxLayout()
-        bars.setSpacing(30)
+        bars.setSpacing(48)
         bars.addStretch(1)
-        for key, label in (("input", "输入"), ("output", "输出")):
+        for key, label in (("input", "输入设备"), ("output", "输出设备")):
             col = QVBoxLayout()
             col.setSpacing(4)
             bar = QProgressBar()
@@ -3760,6 +3794,10 @@ class HomeWindow(QMainWindow):
             value_label.setObjectName("infoValue")
             value_label.setAlignment(Qt.AlignCenter)
             col.addWidget(value_label)
+            device_label = QLabel(label)
+            device_label.setObjectName("infoValue")
+            device_label.setAlignment(Qt.AlignCenter)
+            col.addWidget(device_label)
             name_label = QLabel(label)
             name_label.setObjectName("hintText")
             name_label.setAlignment(Qt.AlignCenter)
@@ -3767,13 +3805,59 @@ class HomeWindow(QMainWindow):
             bars.addLayout(col)
             setattr(self, f"{prefix}_{key}_volume_bar", bar)
             setattr(self, f"{prefix}_{key}_volume_label", value_label)
+            setattr(self, f"{prefix}_{key}_device_label", device_label)
         bars.addStretch(1)
         box.addLayout(bars, 1)
         return meter
 
+    def _refresh_volume_meter_device_labels(self) -> None:
+        """把音量监控两根柱子的标签换成**当前选中的设备名**。
+
+        监控的本来就是变声的输入 / 输出设备，光写「输入设备 / 输出设备」用户
+        看不出在监控谁。文本变了才写（这函数在音量回调里每帧跑，不能每帧都动
+        控件）；设备没读到时退回静态文案。
+        """
+        for prefix, in_combo, out_combo in (
+            ("rvc", "rvc_input_device", "rvc_output_device"),
+            ("home_rvc", "home_rvc_input_device", "home_rvc_output_device"),
+        ):
+            for key, combo_attr, fallback in (
+                ("input", in_combo, "输入设备"),
+                ("output", out_combo, "输出设备"),
+            ):
+                label = getattr(self, f"{prefix}_{key}_device_label", None)
+                if label is None:
+                    continue
+                combo = getattr(self, combo_attr, None)
+                name = ""
+                if combo is not None:
+                    name = str(combo.currentText() or "").strip()
+                if len(name) > 18:
+                    name = name[:17] + "…"
+                cache = getattr(self, "_meter_device_texts", None)
+                if cache is None:
+                    cache = {}
+                    self._meter_device_texts = cache
+                cache_key = f"{prefix}_{key}"
+                if cache.get(cache_key) == name:
+                    continue
+                cache[cache_key] = name
+                label.setText(name or fallback)
+                label.setToolTip(name or fallback)
+
     # ------------------------------------------------------------------
     # 调音台（独立弹窗，见 app/ui/mixer_dialog.py）
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _combo_current_text(combo) -> str:
+        """读下拉框当前文本；控件不存在 / 还没建好时返回空串。"""
+        if combo is None:
+            return ""
+        try:
+            return str(combo.currentText() or "").strip()
+        except Exception:
+            return ""
 
     def _on_mixer_clicked(self) -> None:
         dlg = getattr(self, "_mixer_dialog", None)
@@ -3787,6 +3871,12 @@ class HomeWindow(QMainWindow):
             show_info(self, "星弦", f"调音台不可用：{e}")
             return
         dlg = MixerDialog(self, self.settings_store)
+        # 第一次打开（没有任何已存通道）时自动把当前变声的输入 / 输出设备
+        # 加为监控通道——否则窗口一片空白，看起来就像「实时音量没有」。
+        dlg.ensure_default_channels([
+            self._combo_current_text(getattr(self, "rvc_input_device", None)),
+            self._combo_current_text(getattr(self, "rvc_output_device", None)),
+        ])
         dlg.finished.connect(lambda _=0: setattr(self, "_mixer_dialog", None))
         self._mixer_dialog = dlg
         dlg.show()
@@ -4539,9 +4629,8 @@ class HomeWindow(QMainWindow):
         left_panel = QFrame()
         left_panel.setObjectName("panel")
         left_panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        left_layout = QVBoxLayout(left_panel)
-        left_layout.setContentsMargins(16, 14, 16, 14)
-        left_layout.setSpacing(12)
+        # 两栏都放进滚动区：窗口一矮，内容会被压到看不见文字
+        left_layout = self._make_scroll_column(left_panel)
 
         # 模型选择区域
         model_title = QLabel("RVC 模型选择")
@@ -4658,9 +4747,7 @@ class HomeWindow(QMainWindow):
         right_panel = QFrame()
         right_panel.setObjectName("panel")
         right_panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        right_layout = QVBoxLayout(right_panel)
-        right_layout.setContentsMargins(16, 14, 16, 14)
-        right_layout.setSpacing(12)
+        right_layout = self._make_scroll_column(right_panel)
 
         # 音频设备选择区域（始终显示）
         device_title = QLabel("音频设备选择")
@@ -6381,6 +6468,8 @@ class HomeWindow(QMainWindow):
 
     def _on_rvc_volume_updated(self, input_volume: int, output_volume: int) -> None:
         """在主线程中更新所有音量监听表（音频页 + 首页）。"""
+        # 设备名标签蹭这个节拍刷（内部有缓存，文本没变就不动控件）
+        self._refresh_volume_meter_device_labels()
         for prefix in ("rvc", "home_rvc"):
             in_bar = getattr(self, f"{prefix}_input_volume_bar", None)
             if in_bar is not None:
